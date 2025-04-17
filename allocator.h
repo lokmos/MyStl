@@ -25,6 +25,8 @@ public:
     // 对于无状态的allocator来说，构造函数和拷贝构造函数用默认的即可
     constexpr allocator() noexcept = default;
     constexpr allocator(const allocator&) noexcept = default;
+    constexpr allocator(allocator&&) noexcept = default;
+    constexpr allocator& operator=(allocator&&) noexcept = default;
     
     // 类型转换构造函数，因为allocator无状态，也不依赖U的内部信息
     // 所以这么做完全不会有问题，只是为了满足标准容器的 rebind / allocator_traits 要求

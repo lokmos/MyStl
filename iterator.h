@@ -2,6 +2,8 @@
 #define MYSTL_ITERATOR_H
 
 #include <cstddef>
+#include <type_traits>
+#include <concepts>
 
 namespace mystl
 {
@@ -57,6 +59,7 @@ struct iterator_traits<T*>
     using reference = T&;
 };
 
+// 注意，这个版本也要写
 template <typename T>
 struct iterator_traits<const T*>
 {
@@ -65,6 +68,16 @@ struct iterator_traits<const T*>
     using difference_type = std::ptrdiff_t;
     using pointer = const T*;
     using reference = const T&;
+};
+
+template <typename T>
+struct iterator_traits<T* const>
+{
+    using iterator_category = random_access_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = T* const;
+    using reference = T&;
 };
 
 // output_iterator_tag
@@ -396,7 +409,8 @@ template <typename Iter>
 class reverse_iterator
 {
 public:
-    using iterator_type = Iter;
+    // 去除 const 限定符，防止出现 int* const 错误
+    using iterator_type = std::remove_cv_t<std::remove_reference_t<Iter>>;
     using iterator_category = typename iterator_traits<Iter>::iterator_category;
     using value_type = typename iterator_traits<Iter>::value_type;
     using difference_type = typename iterator_traits<Iter>::difference_type;
@@ -417,7 +431,7 @@ public:
     Iter base() const { return current_; }
 
     reference operator*() const {
-        Iter tmp = current_;
+        auto tmp = current_;
         return *--tmp;
     }
 
@@ -502,8 +516,37 @@ public:
     }
 
 private:
-    Iter current_;
+    using nonconst_iterator = std::remove_const_t<Iter>;
+    nonconst_iterator current_;
 };
+
+// distance 函数
+// input/forward
+template <typename InputIt>
+typename iterator_traits<InputIt>::difference_type
+__distance_impl(InputIt first, InputIt last, input_iterator_tag)
+{
+    typename iterator_traits<InputIt>::difference_type n = 0;
+    while (first != last) {
+        ++first;
+        ++n;
+    }
+    return n;
+}
+
+// random_access/contiguous
+template <typename RandomIt>
+typename iterator_traits<RandomIt>::difference_type
+__distance_impl(RandomIt first, RandomIt last, random_access_iterator_tag)
+{
+    return last - first;
+}
+
+template <typename Iter>
+typename iterator_traits<Iter>::difference_type
+distance(Iter first, Iter last) {
+    return __distance_impl(first, last, typename iterator_traits<Iter>::iterator_category());
+}
 
 } // namespace mystl
 

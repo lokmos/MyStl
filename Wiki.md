@@ -509,6 +509,29 @@ reverse_iterator 是一个适配器（Adapter），其本质设计是，对于�
 
 - 如果使用了某个底层迭代器不支持的函数，编译会报错，这也是标准库预期的功能
 
+## 补充
+
+### 通用判断
+
+```c++
+mystl::is_iterator_of_tag<Iter, mystl::input_iterator_tag> → true/false
+```
+
+用于判断某个迭代器 `Iter` 是否属于（或派生于）指定的 iterator tag
+
+```c++
+template <typename Iter, typename Tag>
+concept is_iterator_of_tag = requires {
+    typename iterator_traits<Iter>::iterator_category;
+    requires std::derived_from<typename iterator_traits<Iter>::iterator_category, Tag>;
+};
+```
+
+- `typename iterator_traits<Iter>::iterator_category`：先提取该迭代器的 category。
+- `requires std::derived_from<...>`：判断这个 category 是否是我们指定的 Tag 的派生类。
+  - 使用派生，我们可以确保，如果某个低级的 iterator 通过判断，那么比它高级的 iterator 一定也能通过判断
+  - 这体现了STL 算法和容器设计时的原则：函数接受的迭代器类型，应为它正确工作的最“低级”迭代器种类
+
 ## 和标准库的差距
 
 ### 当前实现
@@ -598,9 +621,226 @@ class vector {
 
 ## vector
 
-### 构造函数
+### 成员函数
 
-#### `vector(size_type n, const T& val)` —— 用一个值构造 n 个元素
+`void emplace_back(Args&&... args)`
+
+这个函数用于向 vector 中添加元素，并在容量不足时触发扩容
+
+```c++
+template <typename... Args>
+void emplace_back(Args&&... args)
+{
+  if (this->_finish != this->_end_of_storage) {
+      this->_allocator.construct(this->_finish, std::forward<Args>(args)...);
+      ++this->_finish;
+  }
+  else {
+      _realloc_insert(std::forward<Args>(args)...);
+  }
+}
+```
+
+### 通用函数
+
+按照标准库做法，这些函数会用在 vector 接口的不同实现中，所以预先实现这些功能
+
+#### `_fill_initialize(n, val)`
+
+该函数构造正好 n 个元素，不预留额外空间
+
+- 构造函数的语义是“准确地初始化 N 个元素”
+  - 它不是 reserve 语义
+  - 用户没请求额外空间，库就不该超配（否则浪费）
+- 构造时多余的内存是浪费
+
+#### `void _realloc_insert(Args&&... args)`
+
+扩容函数，完成以下几步：
+
+1. 计算新空间大小
+2. 分配新空间大小的内存
+3. 移动旧元素
+4. 插入新元素
+5. 销毁旧元素并释放空间
+
+在3，4步中，如果构造失败，则要销毁已构造并释放新内存
+
+```c++
+template <typename... Args>
+void _realloc_insert(Args&&... args)
+{
+  const size_type old_size = this->_finish - this->_start;
+  const size_type old_capacity = this->_end_of_storage - this->_start;
+  const size_type new_capacity = old_capacity == 0 ? 1 : old_capacity * 2;
+
+  pointer new_start = this->_allocator.allocate(new_capacity);
+  pointer new_finish = new_start;
+
+  try {
+      // 移动旧元素
+      for (pointer p = this->_start; p != this->_finish; ++p, ++new_finish) {
+          this->_allocator.construct(new_finish, std::move(*p));
+      }
+
+      // 插入新元素
+      this->_allocator.construct(new_finish, std::forward<Args>(args)...);
+      ++new_finish;
+  }
+  catch(...) {
+      // 构造失败则销毁已构造并释放新内存
+      for (pointer p = new_start; p != new_finish; ++p) {
+          this->_allocator.destroy(p);
+      }
+      this->_allocator.deallocate(new_start, new_capacity);
+      throw;
+  }
+
+  // 销毁旧元素并释放旧空间
+  for (pointer p = this->_start; p != this->_finish; ++p) {
+      this->_allocator.destroy(p);
+  }
+  this->_allocator.deallocate(this->_start, old_capacity);
+
+  // 更新指针
+  this->_start = new_start;
+  this->_finish = new_finish;
+  this->_end_of_storage = new_start + new_capacity;
+}
+```
+
+在移动旧元素时，使用 `std::move`　是为了支持那些 只能移动，不能拷贝 的类型：
+
+- `std::unique_ptr<T>`
+- 带 `delete copy constructor` 的类（常用于资源管理）
+- 不支持 copy，但支持 move 的自定义对象
+
+使用 `move` 后，新旧地址的资源不会冲突，以 `unique_ptr` 为例
+
+```c++
+unique_ptr(unique_ptr&& other) noexcept
+    : ptr_(other.ptr_) {
+    other.ptr_ = nullptr; // <== 核心逻辑在这
+}
+```
+
+- 不会有两个拥有相同资源的地址，不会冲突，unique_ptr 被移动后旧地址会失效
+- 新的 unique_ptr 拿走了原来的资源（原来的地址）
+- 原来的 unique_ptr 变成空指针，不再拥有任何资源
+  - 当 old 析构时，delete nullptr 是合法的、什么都不做
+
+这里不能使用 `std::move_if_noexcept`
+
+- 它的行为是：
+  - 如果 T 的 move 构造函数是 noexcept，就用 std::move(x)；
+  - 否则用 x（调用拷贝构造）。
+- 它的设计意图是：
+  - 在 可能会抛异常 的情况下，避免 move 破坏了源对象，转而使用 safer 的 copy。
+- 原因一：在重新构造 old elements 时，不怕异常
+  - 此处是新空间中的构造操作，即便抛异常，我们会：
+    - 及时 destroy() 已构造元素
+    - deallocate() 新空间
+    - 保持原 vector 的数据不动（因为原数据还在 old buffer）
+- 原因二：如果用了 move_if_noexcept，反而不如 move
+  - 考虑一个只有 move 构造、但 `noexcept(false)`
+  - 使用 std::move_if_noexcept(x) 会 fallback 到 copy —— 而这个类没有 copy，直接报错！
+
+#### `_range_initialize`
+
+这个函数的目标，是构造两个迭代器所指示的区间内的值，因为只有 random access 及以上的迭代器才可以获得区间长度，所以有两种针对不同迭代器的实现
+
+```c++
+    // input/forward
+    template <typename InputIt>
+    void _range_initialize(InputIt first, InputIt last, std::input_iterator_tag)
+    {
+        while (first != last) {
+            emplace_back(*first);
+            ++first;
+        }
+    }
+
+    // random access/contiguous
+    template <typename RandomIt>
+    void _range_initialize(RandomIt first, RandomIt last, std::random_access_iterator_tag)
+    {
+        size_type n = static_cast<size_type>(last - first);
+        this->_start = this->_allocator.allocate(n);
+        this->_finish = this->_start;
+        this->_end_of_storage = this->_start + n;
+
+        try {
+            for (; first != last; ++first, ++this->_finish) {
+                this->_allocator.construct(this->_finish, *first);
+            }
+        } catch (...) {
+            for (pointer p = this->_start; p != this->_finish; ++p)
+                this->_allocator.destroy(p);
+            this->_allocator.deallocate(this->_start, n);
+            this->_start = this->_finish = this->_end_of_storage = nullptr;
+            throw;
+        }
+    }
+```
+
+对于使用 emplace_back 的版本来说，会引入扩容的操作，但因为事先不知道区间大小，所以无法预分配精准的空间，因此这样的做法是合理的。
+
+- 会带来空间上的浪费
+
+### 构造相关函数
+
+#### `explicit vector(const allocator_type& alloc)`
+
+显式的 allocator 构造，基类 `vector_base` 接受一个 allocator 作为构造参数，因此直接调用对应基类的构造函数即可
+
+```c++
+explicit vector(const allocator_type& alloc) : base(alloc) {}
+```
+
+#### `vector() noexcept(noexcept(Allocator()))`
+
+`vector() noexcept(noexcept(Allocator())) : vector(Allocator()) {}`
+
+是 C++11 以来标准库推荐的实现方式，目的是：
+
+- ✅ 利用 统一委托构造（delegating constructor）简化逻辑
+- ✅ 保证 noexcept 语义对齐：如果构造 Allocator() 是 noexcept，这个默认构造函数也是 noexcept
+  - 其意思是，如果默认构造 allocator 不会抛异常，那么整个 vector 构造也不会抛异常
+
+借用上一个显式的 allocator 构造函数
+
+```c++
+vector() noexcept(noexcept(allocator_type())) : vector(allocator_type()) {}
+```
+
+#### `explicit vector(size_type n, const allocator_type& alloc = allocator_type())`
+
+目标：构造一个包含 `count` 个元素的 `vector`，其中每个元素都是通过默认构造 `T{}` 得到的
+
+类型要求
+
+- `std::default_initializable<T>`: 确保 `T{}` 是合法表达式
+
+```c++
+template <std::default_initializable U = T>
+explicit vector(size_type n, const allocator_type& alloc = allocator_type())
+  : base(alloc)
+{
+  _fill_initialize(n, T{});
+}
+```
+
+cppreference 要求
+
+- Constructs a vector with `count` default-inserted objects of T. No copies are made.
+- If T is not DefaultInsertable into `std::vector<T>`, the behavior is undefined.
+- `template <std::default_initializable U = T>`
+  - `U` 是一个模板参数，默认是 `T`。
+  - `std::default_initializable<U>` 是一个 **Concept**，用于检查：
+    - 是否可以写 `U u{}` 进行默认构造
+  - 如果 `T` 没有默认构造函数（如 `struct S { S(int); };）`，这段代码将 拒绝实例化
+
+#### `constexpr vector(size_type count, const T& value, const allocator_type& alloc = allocator_type())` —— 用一个值构造 n 个元素
 
 它需要完成的事情：
 
@@ -609,3 +849,330 @@ class vector {
 - 设置 `_start`, `_finish`, `_end_of_storage`
 
 该函数调用 `_fill_initialize(n, val)` 来完成
+
+#### `constexpr vector(InputIt first, InputIt last, const allocator& alloc = allocator_type())`
+
+区间构造函数，因为 InputIterator 和 RandomAccessIterator 有区别，后者可以提前获取区间大小，而前者只能逐一遍历，所以在实现策略上也不同，要实现函数分发。这一点借助于 `_range_initialize` 的两个不同版本实现。
+
+```c++
+template <typename Integer>
+    requires std::integral<Integer>
+    vector(Integer n, const T& value, const allocator_type& alloc = allocator_type())
+        : base(alloc)
+    {
+        _fill_initialize(static_cast<size_type>(n), value);
+    }
+
+    // 区间构造，使用标准 iterator_traits 和 iterator_category
+    template<typename InputIt>
+    requires std::input_iterator<InputIt> &&
+             std::constructible_from<T, typename std::iterator_traits<InputIt>::reference> &&
+             (!std::integral<InputIt>)
+    vector(InputIt first, InputIt last, const allocator_type& alloc = allocator_type())
+        : base(alloc)
+    {
+        _range_initialize(first, last, typename std::iterator_traits<InputIt>::iterator_category{});
+    }
+```
+
+区间构造函数很复杂，因为如果不做限定，一个构造函数例如 `vector(5,10)` 就会落入到这个构造函数中，但 `int` 显然不具有迭代器的任何性质，所以会报错
+
+在 vector(4, 10) 中，参数类型是两个 int，于是 C++ 会尝试匹配：
+
+- vector(int, int) ← 这是可以视为 InputIt first = int, InputIt last = int 的一个模板实例
+- vector(size_type, const T&) ← 也能匹配
+
+所以 两者都可以匹配成功，但：
+
+- 模板函数的推导优先级会偏向“更泛化”的模板（即 InputIt 版本），如果它能匹配，那它就会被选择！
+
+因为：
+
+- int 可以是 InputIt（虽然是个不合法的 iterator，但语义上类型满足）
+
+#### 拷贝构造
+
+```c++
+// 拷贝构造
+constexpr vector(const vector& other)
+    : base(other._allocator)
+{
+    _range_initialize(other._start, other._finish, std::random_access_iterator_tag{});
+}
+
+constexpr vector(const vector& other, const Allocator& alloc)
+    : base(alloc)
+{
+    _range_initialize(other._start, other._finish, std::random_access_iterator_tag{});
+}
+```
+
+#### 移动构造
+
+##### `constexpr vector(vector&& other) noexcept`
+
+```c++
+constexpr vector(vector&& other) noexcept
+    : base(std::move(other.allocator))
+{
+    this->_start = other._start;
+    this->_finish = other._finish;
+    this->_end_of_storage = other._end_of_storage;
+
+    other._start = nullptr;
+    other._finish = nullptr;
+    other._end_of_storage = nullptr;
+}
+```
+
+前提需要保证 allocator 是可以移动的，当然，因为我实现的allocator是无状态的，所以使用默认的移动构造和移动赋值函数即可
+
+注意一定要把原来的 vector 的指针都置空，这样才符合移动的语义
+
+##### `constexpr vector(vector&& other, const allocator_type& alloc)`
+
+```c++
+constexpr vector(vector&& other, const allocator_type& alloc)
+    : base(alloc)
+{
+    if (alloc == other._allocator) {
+        this->_start = other._start;
+        this->_finish = other._finish;
+        this->_end_of_storage = other._end_of_storage;
+        other._start = nullptr;
+        other._finish = nullptr;
+        other._end_of_storage = nullptr;
+    }
+    else {
+        _range_initialize(
+            std::make_move_iterator(other._start),
+            std::make_move_iterator(other._finish),
+            std::random_access_iterator_tag{}
+        );
+    }
+}
+```
+
+如果 alloc 和目标 vector 的 allocator 一致，说明可以直接偷取原vector的资源，因此和第一个移动构造函数没有区别。否则，因为两者的 allocator 不同，只能采取一个一个 move 元素的方法，这一点可以交给 `_range_initialize`　来完成，但因为是 move，所以需要用 `std::make_move_iterator`
+
+- 它是 C++11 引入的一个工具函数，用于将普通迭代器包装成一个“移动迭代器”
+- 它让迭代器在解引用`（*it）`时返回 `std::move(*it)`，而不是 `*it` 本身
+- 用一个专门为“移动”而设计的迭代器来初始化当前容器，避免拷贝，提升性能
+
+#### 初始化列表构造函数
+
+```c++
+constexpr vector(std::initializer_list<T> init, const allocator_type& alloc = allocator_type())
+    : base(alloc)
+{
+    _range_initialize(init.begin(), init.end(), std::random_access_iterator_tag{});
+}
+```
+
+### 析构函数
+
+```c++
+~vector()
+{
+    // 首先销毁所有元素
+    for (pointer p = this->_start; p != this->_finish; ++p) {
+        this->_allocator.destroy(p);
+    }
+
+    // 然后释放内存
+    this->_allocator.deallocate(this->_start, mystl::distance(this->_start, this->_end_of_storage));
+    
+    // 最后将指针置空
+    this->_start = nullptr;
+    this->_finish = nullptr;
+    this->_end_of_storage = nullptr;
+}
+```
+
+### 拷贝赋值
+
+#### `vector& operator=(const vector& other)`
+
+这个操作的本质是 深拷贝赋值，核心目标是：将 `other` 中的元素拷贝到当前对象中，并保持强异常安全。
+
+```c++
+constexpr vector& operator=(const vector& other)
+{
+    if (this == other) {
+        return *this;
+    }
+
+    const size_type otherSize = other.size();
+
+    if (otherSize > this->capacity()) {
+        // 容量不足，采用强异常安全策略：先构造一个副本，再 swap
+        vector tmp(other);  // 拷贝构造
+        this->swap(tmp);    // 交换资源，旧资源由 tmp 析构时自动释放
+    } else {
+        // 容量足够，重用现有内存
+        size_type i = 0;
+        // 赋值已有元素
+        for (; i < this->size() && i < otherSize; ++i) {
+            this->_start[i] = other._start[i];
+        }
+        // 构造新元素（如果 other 比当前长）
+        for (; i < otherSize; ++i) {
+            this->_allocator.construct(this->_start + i, other._start[i]);
+            ++this->_finish;
+        }
+        // 销毁多余元素（如果当前比 other 长）
+        for (; i < this->size(); ++i) {
+            this->_allocator.destroy(this->_start + i);
+        }
+        this->_finish = this->_start + otherSize;
+    }
+}
+```
+
+首先判断是否是自赋值
+
+- 如果是，则直接返回，不需要任何操作
+- 否则进入拷贝赋值阶段
+
+在拷贝赋值阶段，先判断当前 vector 容量是否足够
+
+- 如果容量不足，采用强异常安全策略：先构造一个副本，再 swap
+- 否则重用现有内存
+  - 在赋值已有元素的时候，不需要考虑两个 vector 的 allocator 不同的情况
+    - 此处我们已经处于拷贝赋值运算符内部，所以 other._allocator 是 const Allocator&，我们无法修改它，也 不允许 拷贝 other._allocator 替换当前对象的 allocator。
+    - 标准库的实现约定：
+      - 即使 other._allocator 与 this->_allocator 不同，拷贝赋值也不会替换 allocator。
+      - allocator 的一致性只在 拷贝构造 和 **operator=(vector&&)（根据 propagate_on_container_move_assignment）中处理。
+      - 如果你想允许在拷贝赋值时替换 allocator，你得实现 operator=(const vector& other, const allocator_type&)，这在标准中并不存在。
+  - 另外，也不需要考虑类型不一致的问题
+    - operator= 是成员函数，这两个 vector 必须是完全相同模板类型的实例，即 `vector<T, Alloc>`
+    - 若你需要支持类型转换（如 `vector<int>` 赋值给 `vector<float>`），那属于 容器间的转换赋值，标准库不支持，也不应由这个函数承担。
+
+### 迭代器相关函数
+
+| 用法        | 对象类型           | 返回类型         | 是否可修改元素 |
+|-------------|--------------------|------------------|----------------|
+| `begin()`   | 非 `const` 容器    | `iterator`       | ✅ 是           |
+| `begin()`   | `const` 容器       | `const_iterator` | ❌ 否           |
+| `cbegin()`  | 任意（包括非 `const`）| `const_iterator` | ❌ 否           |
+
+```c++
+constexpr iterator begin() noexcept
+{
+    return this->_start;
+}
+
+constexpr const_iterator begin() const noexcept
+{
+    return this->_start;
+}
+
+constexpr const_iterator cbegin() const noexcept
+{
+    return this->_start;
+}
+
+constexpr iterator end() noexcept
+{
+    return this->_finish;
+}
+
+constexpr const_iterator end() const noexcept
+{
+    return this->_finish;
+}
+
+constexpr const_iterator cend() const noexcept
+{
+    return this->_finish;
+}
+
+// 按照cppreference，reverse_iterator 实际上 持有的是指向其要访问的元素“下一位”的迭代器”
+// rbegin() 返回最后一个元素，因此其应当指向 finish，这样解引用的时候，就可以顺利访问到最后一个元素
+constexpr reverse_iterator rbegin() noexcept
+{
+    return reverse_iterator(this->_finish);
+}
+
+constexpr const_reverse_iterator rbegin() const noexcept
+{
+    return const_reverse_iterator(this->_finish);
+} 
+
+constexpr const_reverse_iterator crbegin() const noexcept
+{
+    return const_reverse_iterator(this->_finish);
+}
+
+// rend() 返回第一个元素的前一位，因此其应当指向 start，这样解引用的时候，就可以指向第一个元素的前一位
+constexpr reverse_iterator rend() noexcept
+{
+    return reverse_iterator(this->_start);
+}
+
+constexpr const_reverse_iterator rend() const noexcept
+{
+    return const_reverse_iterator(this->_start);
+}
+
+constexpr const_reverse_iterator crend() const noexcept
+{
+    return const_reverse_iterator(this->_start);
+}
+```
+
+C++ 编译器会根据对象的const性来决定调用哪个版本的 begin
+
+- 当容器对象是 const 类型时，只能调用带有 const 限定符的成员函数；
+- 而你的 begin() 函数如果没有 const 限定符，就不允许被 const 对象调用。
+- cbegin() 通常是为了明确表示“我就是要一个 const_iterator，不管容器是不是 const”，它避免了隐式类型混淆，也增加了可读性。
+
+```c++
+vector<int> v;
+auto it = v.begin();  // 调用的是 iterator begin()
+const vector<int> cv;
+auto it = cv.begin();  // 调用的是 const_iterator begin() const
+```
+
+#### 遇到的核心问题
+
+```c++
+const vector<int> vec = {5, 6, 7};
+
+auto rit = vec.rbegin();
+EXPECT_EQ(*rit, 7);
+++rit;
+EXPECT_EQ(*rit, 6);
+++rit;
+EXPECT_EQ(*rit, 5);
+++rit;
+EXPECT_EQ(rit, vec.rend());
+```
+
+对于一个 const vector 来说，使用 const_iterator 时，reverse_iterator 被实例化为： `reverse_iterator<int* const>`，导致以下编译错误：
+
+```bash
+error: decrement of read-only variable ‘tmp’
+error: decrement of read-only member ‘current_’
+```
+
+本质原因是：
+
+- int* const 是 不可修改的指针，即 const 修饰了指针本身，而不是指向的值；
+- 这使得你无法执行 --current_、--tmp 等操作，因为这些操作会修改指针本身；
+- 但 reverse_iterator 的核心功能就是维护一个可变的底层迭代器 current_。
+
+解决办法是在 reverse_iterator 中移除对 const 的修饰
+
+- 类型萃取的处理
+  - `using iterator_type = std::remove_cv_t<std::remove_reference_t<Iter>>;`
+  - 这一步确保了 `reverse_iterator<int* const>` 会变成 `reverse_iterator<int*>`，从而支持指针自增减。
+- 修正成员类型 current_
+
+```c++
+using nonconst_iterator = std::remove_const_t<Iter>;
+nonconst_iterator current_;
+```
+
+- 避免将 current_ 声明为 int* const；
+- 这样在 operator++/-- 等操作中就不会报错。
