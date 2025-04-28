@@ -152,6 +152,60 @@ static_assert(std::is_nothrow_constructible_v<T, Args...>);
 
 - 这些类型判断依赖 constexpr 能力，让 allocator_traits 判断构造、析构是否安全。
 
+## trivial vs non-trivial
+
+### trivial
+
+一个类型是 trivial 的，意味着：
+
+- 它的默认构造函数、拷贝构造函数、拷贝赋值运算符、移动构造函数、移动赋值运算符和析构函数都是编译器自动生成的，并且
+- 这些函数只做简单的内存复制或不做任何操作，没有用户自定义逻辑。
+- 也就是，它们就像 memcpy 那样直接操作内存，没有副作用、没有额外动作。
+
+简单说：trivial 类型可以通过二进制复制来安全地初始化、赋值和销毁。
+
+#### 标准定义（C++标准 § [basic.types.general]）
+
+- 它有一个 trivial 的默认构造函数
+- 如果它有拷贝/移动构造函数或拷贝/移动赋值运算符，它们也必须是 trivial 的
+- 它的析构函数必须是 trivial 的
+- 它没有虚函数，也没有虚基类
+
+#### trivial 的构造和析构
+
+对于平凡类型（trivially‐default‐constructible、trivially‐destructible）的“构造”与“析构”实际上什么都不做——编译器根本不会生成任何初始化或清理的代码
+
+- 平凡的默认构造
+  - 例如内置类型 int、POD struct，或者带默认成员初始值的简单 aggregate，它们的默认构造就是一个“空操作”。
+  - 在 C++ 术语里，`std::is_trivially_default_constructible_v<T>` 为 true 时，T{} 或 new (p) T 都不会在运行时生成任何指令。
+- 平凡的析构
+  - 如果 `std::is_trivially_destructible_v<T>` 为 true，那么对它们调用析构也是空操作，编译器不会做任何事情。
+
+因此，当我们在一大块原始内存上“批量构造”或“批量析构”平凡类型时，实际上无需逐个调用构造/析构：
+
+- 构造时，你只要把指针往前推进就相当于调用了一系列的空操作。
+- 析构时，同理——什么都不用做，直接跳过。
+
+### non-trivial
+
+如果一个类型自定义了上述某些函数（比如构造函数、析构函数、拷贝/移动函数），或者需要做额外的工作，比如：
+
+- 需要初始化资源（new、malloc、打开文件、加锁等）
+- 有虚函数表指针（存在继承和多态）
+- 需要正确地析构子对象
+- 需要执行复杂逻辑，比如日志输出、状态设置
+- 有虚基类
+
+那么这个类型就是 non-trivial 的
+
+### 区分的原因
+
+性能考虑：trivial 类型可以用 memcpy、malloc/free，更快，优化器也能更好地优化。
+
+标准库要求：比如 `std::is_trivial<T>`、`std::is_trivially_copyable<T>` 这些 traits，可以根据类型是不是 trivial 来决定是否使用更高效的实现。
+
+ABI（应用二进制接口）一致性：trivial 类型在不同编译器、不同平台之间，内存布局和操作规则是一样的；non-trivial 类型可能不同。
+
 # 配置器
 
 ## allocator
@@ -566,6 +620,130 @@ concept is_iterator_of_tag = requires {
 | range/ranges 适配         | ⭐⭐     | 提供 `sentinel`, `common_iterator`  |
 | allocator-aware iterator | ⭐      | 提供能提取容器内 allocator 的 iterator |
 
+# memory
+
+这个头文件中存放和内存相关的一些操作
+
+## 批量填充和析构
+
+### 批量填充 n 个元素
+
+```c++
+// uninitialized_value_construct_n
+// Constructs n elements of type T in uninitialized memory [first, first+n)
+// If T is trivially default-constructible, skips per-element calls.
+template <typename Alloc, typename ForwardIt, typename Size>
+ForwardIt uninitialized_value_construct_n(Alloc& alloc, ForwardIt first, Size n)
+{
+    using T = typename std::iterator_traits<ForwardIt>::value_type;
+    ForwardIt cur = first;
+    Size constructed = 0;
+    try {
+        // 对于“平凡可默认构造”（POD 或内置类型），不需要逐元素调用 ctor
+        if constexpr(std::is_trivially_default_constructible_v<T>) {
+            // For trivially default-constructible types, zero-initialize if pointer
+            // 如果迭代器真的是原始指针，还可以一次性 memset 将内存清零（value-init 效果）；
+            if constexpr(std::is_pointer_v<ForwardIt>) {
+                std::memset(first, 0, n * sizeof(T));
+            }
+            
+            //直接把已“构造”计数设成 n，并把游标 cur 前移 n。
+            constructed = n;
+            std::advance(cur, n);
+        }
+        else {
+            for(; constructed < n; ++constructed, ++cur) {
+                std::allocator_traits<Alloc>::construct(alloc, std::addressof(*cur));
+            };
+        }
+        return cur;
+    } catch (...) {
+        destroy_n(alloc, first, constructed);
+        throw;
+    }
+}
+
+// uninitialized_fill_n
+// Constructs n copies of value in uninitialized memory [first, first+n)
+// Returns iterator past the last constructed element.
+template <typename Alloc, typename ForwardIt, typename Size, typename U>
+ForwardIt uninitialized_fill_n(Alloc& alloc, ForwardIt first, Size n, const U& value)
+{
+    using T = typename std::iterator_traits<ForwardIt>::value_type;
+    ForwardIt cur = first;
+
+    if constexpr (std::is_trivially_copyable_v<T> && std::is_copy_constructible_v<T>) {
+        // Trivial T: direct placement-new in a simple loop, no exception rollback needed.
+        for (Size i = 0; i < n; ++i, ++cur) {
+            std::allocator_traits<Alloc>::construct(alloc, std::addressof(*cur), value);
+        }
+    }
+    else {
+        // Non-trivial T: need strong exception safety.
+        Size constructed = 0;
+        try {
+            for (; constructed < n; ++constructed, ++cur) {
+                std::allocator_traits<Alloc>::construct(alloc, std::addressof(*cur), value);
+            }
+        } catch (...) {
+            destroy_n(alloc, first, constructed);
+            throw;
+        }
+    }
+
+    return cur;
+}
+
+// destroy_n
+// Destroys n elements of type T in memory [first, first+n)
+// If T is trivially destructible, does nothing and advances iterator.
+template <typename Alloc, typename ForwardIt, typename Size>
+ForwardIt destroy_n(Alloc& alloc, ForwardIt first, Size n) {
+    using T = typename std::iterator_traits<ForwardIt>::value_type;
+    ForwardIt cur = first;
+    if constexpr (std::is_trivially_destructible_v<T>) {
+        std::advance(cur, n);
+    }
+    else {
+        for (Size i = 0; i < n; ++i, ++cur) {
+            std::allocator_traits<Alloc>::destroy(alloc, std::addressof(*cur));
+        }
+    }
+    return cur;
+}
+```
+
+#### `uninitialized_value_construct_n`
+
+这个函数采用默认构造
+
+- 通过 `iterator_traits` 拿到元素类型 `T`。
+- 对于平凡类型，因为它们的构造函数什么都不做，所以使用 `memset` + `advance` 直接移动指针即可
+- 对于非平凡类型，对每一个位置，用 `allocator_traits::construct(alloc, ptr)` 触发 `new (ptr) T()`。
+
+所谓的在那块内存上以 `placement new` 的方式调用 `T()` —— 也就是默认构造:
+
+```c++
+std::allocator_traits<Alloc>::construct(
+    alloc,
+    std::addressof(*cur)    // 取出 cur（T*）所指内存的地址
+);
+```
+
+等价于：
+
+```c++
+::new (static_cast<void*>(std::addressof(*cur))) T();
+```
+
+#### `uninitialized_fill_n`
+
+这个函数与上一个最大的不同在于不再使用默认构造了，因此，即便是 `trivially copyable`、`trivially default‐constructible` 的类型，标准库的 `std::uninitialized_fill_n` 通常也还是在每个位置做一次 **placement‐new** （或等价的构造/赋值）——因为这才能保证对所有类型都满足正确的构造语义。而它对所谓“平凡类型”的优化，往往只发生在 默认构造（`uninitialized_default_construct_n`／`uninitialized_value_construct_n`）那一支路上
+
+- 因为只有这样才能保证“在未初始化存储上调用 T(x)”这一语义，对所有类型都安全
+- 而对 **trivial** 类型来说，这个 `::new (p) T(x)` 或者 `allocator_traits::construct(alloc,p,x)` 在编译之后，往往就被优化成一条简单的内存拷贝或寄存器赋值指令，根本没有函数调用开销——所以标准库也没必要再额外做 `memcpy` 的 hack。
+- 如果你对非零的填充值做更激进的批量拷贝优化，就需要自己判定迭代器是原始指针且 `T` 是 **trivially_copyable**，然后先在第一个元素上 `construct(…,value)`，再用 `memcpy` 或指数倍增(copy‐doubling)把它复制到后续内存。但这超出了标准规定的通用实现——标准库只在“value‐init”那种“全部置零”场景下才做批量优化。
+
 # vector
 
 ## vector_base
@@ -621,27 +799,7 @@ class vector {
 
 ## vector
 
-### 成员函数
-
-`void emplace_back(Args&&... args)`
-
-这个函数用于向 vector 中添加元素，并在容量不足时触发扩容
-
-```c++
-template <typename... Args>
-void emplace_back(Args&&... args)
-{
-  if (this->_finish != this->_end_of_storage) {
-      this->_allocator.construct(this->_finish, std::forward<Args>(args)...);
-      ++this->_finish;
-  }
-  else {
-      _realloc_insert(std::forward<Args>(args)...);
-  }
-}
-```
-
-### 通用函数
+### 辅助函数
 
 按照标准库做法，这些函数会用在 vector 接口的不同实现中，所以预先实现这些功能
 
@@ -789,7 +947,9 @@ unique_ptr(unique_ptr&& other) noexcept
 
 ### 构造相关函数
 
-#### `explicit vector(const allocator_type& alloc)`
+#### `vector()`
+
+##### `explicit vector(const allocator_type& alloc)`
 
 显式的 allocator 构造，基类 `vector_base` 接受一个 allocator 作为构造参数，因此直接调用对应基类的构造函数即可
 
@@ -797,7 +957,7 @@ unique_ptr(unique_ptr&& other) noexcept
 explicit vector(const allocator_type& alloc) : base(alloc) {}
 ```
 
-#### `vector() noexcept(noexcept(Allocator()))`
+##### `vector() noexcept(noexcept(Allocator()))`
 
 `vector() noexcept(noexcept(Allocator())) : vector(Allocator()) {}`
 
@@ -813,7 +973,7 @@ explicit vector(const allocator_type& alloc) : base(alloc) {}
 vector() noexcept(noexcept(allocator_type())) : vector(allocator_type()) {}
 ```
 
-#### `explicit vector(size_type n, const allocator_type& alloc = allocator_type())`
+##### `explicit vector(size_type n, const allocator_type& alloc = allocator_type())`
 
 目标：构造一个包含 `count` 个元素的 `vector`，其中每个元素都是通过默认构造 `T{}` 得到的
 
@@ -840,7 +1000,7 @@ cppreference 要求
     - 是否可以写 `U u{}` 进行默认构造
   - 如果 `T` 没有默认构造函数（如 `struct S { S(int); };）`，这段代码将 拒绝实例化
 
-#### `constexpr vector(size_type count, const T& value, const allocator_type& alloc = allocator_type())` —— 用一个值构造 n 个元素
+##### `constexpr vector(size_type count, const T& value, const allocator_type& alloc = allocator_type())` —— 用一个值构造 n 个元素
 
 它需要完成的事情：
 
@@ -850,7 +1010,7 @@ cppreference 要求
 
 该函数调用 `_fill_initialize(n, val)` 来完成
 
-#### `constexpr vector(InputIt first, InputIt last, const allocator& alloc = allocator_type())`
+##### `constexpr vector(InputIt first, InputIt last, const allocator& alloc = allocator_type())`
 
 区间构造函数，因为 InputIterator 和 RandomAccessIterator 有区别，后者可以提前获取区间大小，而前者只能逐一遍历，所以在实现策略上也不同，要实现函数分发。这一点借助于 `_range_initialize` 的两个不同版本实现。
 
@@ -890,7 +1050,26 @@ template <typename Integer>
 
 - int 可以是 InputIt（虽然是个不合法的 iterator，但语义上类型满足）
 
-#### 拷贝构造
+###### 不可拷贝的区间
+
+区间构造实现了两个函数，如果是 不平凡，或者不可拷贝的类型，会走通用的分支，即逐个构造；但是通用版本也会尝试从 `*first` 构造，因此要求类型有一个 拷贝构造函数
+对于 `unique_ptr` 这样只能 move 的类型，即使通用版本也无法直接处理，按照标准库的做法，针对这种类型，不会做特殊化，而是需要用户传入 **移动迭代器**
+
+```c++
+#include <iterator>  // std::make_move_iterator
+
+std::vector<std::unique_ptr<Foo>> src = /*…*/;
+std::vector<std::unique_ptr<Foo>> dst(
+    std::make_move_iterator(src.begin()),
+    std::make_move_iterator(src.end())
+);
+```
+
+- `std::make_move_iterator` 会让 `*it` 产生一个 `T&&`（右值引用）
+- 于是通用构造就变成 `allocator_traits::construct(alloc, address, std::move(original));`
+  - 这正好能调动 unique_ptr 的 移动构造
+
+##### 拷贝构造
 
 ```c++
 // 拷贝构造
@@ -907,9 +1086,9 @@ constexpr vector(const vector& other, const Allocator& alloc)
 }
 ```
 
-#### 移动构造
+##### 移动构造
 
-##### `constexpr vector(vector&& other) noexcept`
+###### `constexpr vector(vector&& other) noexcept`
 
 ```c++
 constexpr vector(vector&& other) noexcept
@@ -929,7 +1108,7 @@ constexpr vector(vector&& other) noexcept
 
 注意一定要把原来的 vector 的指针都置空，这样才符合移动的语义
 
-##### `constexpr vector(vector&& other, const allocator_type& alloc)`
+###### `constexpr vector(vector&& other, const allocator_type& alloc)`
 
 ```c++
 constexpr vector(vector&& other, const allocator_type& alloc)
@@ -959,7 +1138,7 @@ constexpr vector(vector&& other, const allocator_type& alloc)
 - 它让迭代器在解引用`（*it）`时返回 `std::move(*it)`，而不是 `*it` 本身
 - 用一个专门为“移动”而设计的迭代器来初始化当前容器，避免拷贝，提升性能
 
-#### 初始化列表构造函数
+##### 初始化列表构造函数
 
 ```c++
 constexpr vector(std::initializer_list<T> init, const allocator_type& alloc = allocator_type())
@@ -969,7 +1148,7 @@ constexpr vector(std::initializer_list<T> init, const allocator_type& alloc = al
 }
 ```
 
-### 析构函数
+#### 析构函数
 
 ```c++
 ~vector()
@@ -989,43 +1168,54 @@ constexpr vector(std::initializer_list<T> init, const allocator_type& alloc = al
 }
 ```
 
-### 拷贝赋值
+#### 赋值函数
 
-#### `vector& operator=(const vector& other)`
+##### 拷贝赋值
+
+###### `vector& operator=(const vector& other)`
 
 这个操作的本质是 深拷贝赋值，核心目标是：将 `other` 中的元素拷贝到当前对象中，并保持强异常安全。
 
 ```c++
 constexpr vector& operator=(const vector& other)
 {
-    if (this == other) {
+    if (this == &other) {
         return *this;
+    }
+
+    // 如果需要传播 allocator，且 allocator 不等，先释放原有资源
+    if constexpr (std::allocator_traits<allocator_type>::propagate_on_container_copy_assignment::value) {
+        if (this->_allocator != other._allocator) {
+            clear();
+            this->_allocator = other._allocator;
+            this->_start = this->_finish = this->_end_of_storage = nullptr;
+        }
     }
 
     const size_type otherSize = other.size();
 
-    if (otherSize > this->capacity()) {
-        // 容量不足，采用强异常安全策略：先构造一个副本，再 swap
-        vector tmp(other);  // 拷贝构造
-        this->swap(tmp);    // 交换资源，旧资源由 tmp 析构时自动释放
+    if (otherSize > this->.capacity()) {
+        // 强异常安全策略：拷贝构造副本，再交换
+        vector tmp(other);
+        swap(tmp); // tmp 会析构，释放资源
     } else {
-        // 容量足够，重用现有内存
+        // 容量足够，重用内存
         size_type i = 0;
-        // 赋值已有元素
         for (; i < this->size() && i < otherSize; ++i) {
+            // 原始指针天然支持 copy-assign
             this->_start[i] = other._start[i];
         }
-        // 构造新元素（如果 other 比当前长）
         for (; i < otherSize; ++i) {
-            this->_allocator.construct(this->_start + i, other._start[i]);
+            this->_allocator.construct(this->_finish, other._start[i]);
             ++this->_finish;
         }
-        // 销毁多余元素（如果当前比 other 长）
         for (; i < this->size(); ++i) {
             this->_allocator.destroy(this->_start + i);
         }
         this->_finish = this->_start + otherSize;
     }
+    
+    return *this;
 }
 ```
 
@@ -1034,19 +1224,359 @@ constexpr vector& operator=(const vector& other)
 - 如果是，则直接返回，不需要任何操作
 - 否则进入拷贝赋值阶段
 
+按照 cppreference 的要求，需要判断 POCCA 条件
+
+- POCCA 表示 在容器进行拷贝赋值操作时，是否应将 allocator 一起拷贝。
+- 在 C++ 标准库中，分配器（Allocator）控制了容器的内存分配行为，而 allocator 本身可能有状态（比如自定义分配器中保存了一个内存池的指针
+- 这个决策由 allocator_traits 的成员：`std::allocator_traits<Allocator>::propagate_on_container_copy_assignment` 来决定，其类型是 `std::true_type` 或 `std::false_type`。
+
 在拷贝赋值阶段，先判断当前 vector 容量是否足够
 
 - 如果容量不足，采用强异常安全策略：先构造一个副本，再 swap
 - 否则重用现有内存
-  - 在赋值已有元素的时候，不需要考虑两个 vector 的 allocator 不同的情况
-    - 此处我们已经处于拷贝赋值运算符内部，所以 other._allocator 是 const Allocator&，我们无法修改它，也 不允许 拷贝 other._allocator 替换当前对象的 allocator。
-    - 标准库的实现约定：
-      - 即使 other._allocator 与 this->_allocator 不同，拷贝赋值也不会替换 allocator。
-      - allocator 的一致性只在 拷贝构造 和 **operator=(vector&&)（根据 propagate_on_container_move_assignment）中处理。
-      - 如果你想允许在拷贝赋值时替换 allocator，你得实现 operator=(const vector& other, const allocator_type&)，这在标准中并不存在。
   - 另外，也不需要考虑类型不一致的问题
     - operator= 是成员函数，这两个 vector 必须是完全相同模板类型的实例，即 `vector<T, Alloc>`
     - 若你需要支持类型转换（如 `vector<int>` 赋值给 `vector<float>`），那属于 容器间的转换赋值，标准库不支持，也不应由这个函数承担。
+
+###### 标准库实现了类似的逻辑
+
+```c++
+template<typename _Tp, typename _Alloc>
+    _GLIBCXX20_CONSTEXPR
+    vector<_Tp, _Alloc>&
+    vector<_Tp, _Alloc>::
+    operator=(const vector<_Tp, _Alloc>& __x)
+    {
+      if (std::__addressof(__x) != this)
+        {
+        _GLIBCXX_ASAN_ANNOTATE_REINIT;
+    #if __cplusplus >= 201103L
+        if (_Alloc_traits::_S_propagate_on_copy_assign())
+            {
+            if (!_Alloc_traits::_S_always_equal()
+                && _M_get_Tp_allocator() != __x._M_get_Tp_allocator())
+                {
+            // replacement allocator cannot free existing storage
+            this->clear();
+            _M_deallocate(this->_M_impl._M_start,
+                    this->_M_impl._M_end_of_storage
+                    - this->_M_impl._M_start);
+            this->_M_impl._M_start = nullptr;
+            this->_M_impl._M_finish = nullptr;
+            this->_M_impl._M_end_of_storage = nullptr;
+            }
+            std::__alloc_on_copy(_M_get_Tp_allocator(),
+                    __x._M_get_Tp_allocator());
+            }
+    #endif
+        }
+    }
+```
+
+- `_Alloc_traits::_S_propagate_on_copy_assign()` 实际就是 `allocator_traits<Alloc>::propagate_on_container_copy_assignment::value`
+
+##### 移动赋值
+
+```c++
+// 移动赋值
+constexpr vector& operator=(vector&& other) noexcept (
+    std::allocator_traits<Alloc>::propagate_on_container_move_assignment::value ||
+    std::allocator_traits<Alloc>::is_always_equal::value
+)
+{
+    if (this == &other) {
+        return *this;
+    }
+
+    constexpr bool pocma = std::allocator_traits<allocator_type>::propagate_on_container_move_assignment::value;
+
+    // 如果 PO_MCA 为 true，且 allocator 允许传播，直接 move allocator
+    if constexpr (pocma) {
+        // allocator 允许 move 赋值，直接偷资源
+        // 清理旧资源
+        this->clear();
+        this->_allocator.deallocate(this->_start, this->capacity());
+
+        this->_allocator = std::move(other._allocator);
+        this->_start = other._start;
+        this->_finish = other._finish;
+        this->_end_of_storage = other._end_of_storage;
+
+        // cppreference: After the move, other is in a valid but unspecified state.
+        // 这里我们将 other 的指针置空，防止析构时 double free
+        // 仍然可以访问 other，但它的状态是 "有效但未指定"（valid but unspecified） —— 你不能假设其中有任何元素或其 size() 是多少，只能安全执行析构、赋值、clear()、empty() 等操作。
+        other._start = other._finish = other._end_of_storage = nullptr;
+    } else {
+        // allocator 不传播，必须检查是否相等
+        if (this->_allocator == other.allocator) {
+            // allocator 相等，资源可以转移
+            // 清理旧资源
+            this->clear();
+            this->_allocator.deallocate(this->_start, this->capacity());
+
+            this->_start = other._start;
+            this->_finish = other._finish;
+            this->_end_of_storage = other._end_of_storage;
+            other._start = other._finish = other._end_of_storage = nullptr;
+        } else {
+            // allocator 不相等，只能拷贝赋值
+            this->clear();
+            this->_allocator.deallocate(this->_start, this->capacity());
+
+            _range_initialize(
+                std::make_move_iterator(other._start),
+                std::make_move_iterator(other._finish),
+                std::random_access_iterator_tag{}
+            );
+        }
+    }
+}
+```
+
+##### 初始化列表赋值
+
+因为标准库的要求是尽可能复用现有内存，所以需要根据当前 `vector` 的 `capacity`，选择不同的策略
+
+```c++
+constexpr vector& operator=(std::initializer_list<value_type> ilist)
+{
+    const size_type n = ilist.size();
+
+    if (n > this->capacity()) {
+        // 容量不足，重新分配内存
+        vector tmp(ilist);
+        this->swap(tmp);
+    } else {
+        auto it = ilist.begin();
+        size_type i = 0;
+
+        for (; i < this->size() && it != ilist.end(); ++i, ++it) {
+            this->_start[i] = *it;
+        }
+
+        // 构造新元素（如果 ilist 比当前长）
+        for (; it != ilist.end(); ++i; ++it) {
+            this->_allocator.construct(this->_finish, *it);
+        }
+
+        // 销毁多余元素（如果当前比 ilist 长）
+        for (; i  < this->size(); ++i) {
+            this->_allocator.destroy(this->_start + i);
+        }
+
+        this->_finish = this->_start + n;
+    }
+
+    return *this;
+}
+```
+
+#### assign
+
+总体的逻辑是：
+
+1. 如果 `count <= size()`：
+
+   - 覆盖前 `count` 个元素。
+   - 销毁多余的（`size() - count`）元素。
+   - 不重新分配内存。
+
+2. 如果 `count <= capacity()`：
+
+   - 覆盖已有元素。
+   - 构造新元素（从 `size()` 到 `count`）。
+   - 不重新分配内存。
+
+3. 如果 `count > capacity()`：
+
+   - 析构所有元素。
+   - 重新分配内存并填充构造。
+
+##### `void assign( size_type count, const T& value )`
+
+```c++
+constexpr void assign (size_type count, const T& value)
+{
+    if (count > this->capacity()) {
+        vector tmp(count, value, this->_allocator);
+        this->swap(tmp);
+    } else {
+        size_type i = 0;
+
+        for (; i < this->size() && i < count; ++i) {
+            this->_start[i] = value;
+        }
+
+        for (; i < count; ++i) {
+            this->_allocator.construct(this->_start + i, value);
+            // 建议 finish 在这里更新，避免中间异常导致 finish 未定义
+            ++this->_finish;
+        }
+
+        for (; i < this->size(); ++i) {
+            this->_allocator.destroy(this->_start + i);
+        }
+    }
+}
+```
+
+##### `constexpr void assign(InputIt first, InputIt last)`
+
+```c++
+template <typename InputIt>
+requires std::input_iterator<InputIt> &&
+            std::constructible_from<T, typename std::iterator_traits<InputIt>::reference> &&
+            (!std::integral<InputIt>)
+constexpr void assign(InputIt first, InputIt last)
+{
+    const size_type n = mystl::distance(first, last);
+
+    if (n > this->capacity()) {
+        vector tmp(first, last);
+        this->swap(tmp);
+    } else {
+        size_type i = 0;
+
+        for (; i < this->size() && first != last; ++i, ++first) {
+            this->_start[i] = *first;
+        }
+
+        for (; first != last; ++first, ++i) {
+            this->_allocator.construct(this->_start + i, *first);
+            ++this->_finish;
+        }
+
+        for (; i < this->size(); ++i) {
+            this->_allocator.destroy(this->_start + i);
+        }
+        this->_finish = this->_start + n;
+    }
+}
+```
+
+##### `constexpr void assign (std::initializer_list<value_type> ilist)`
+
+```c++
+constexpr void assign (std::initializer_list<value_type> ilist)
+{
+    const size_type n = ilist.size();
+
+    if (n > this->capacity()) {
+        vector tmp(ilist);
+        this->swap(tmp);
+    } else {
+        auto it = ilist.begin();
+        size_type i = 0;
+
+        for (; i < this->size() && it != ilist.end(); ++i, ++it) {
+            this->_start[i] = *it;
+        }
+
+        for (; it != ilist.end(); ++i, ++it) {
+            this->_allocator.construct(this->_start + i, *it);
+            ++this->_finish;
+        }
+        
+        for (; i < this->size(); ++i) {
+            this->_allocator.destroy(this->_start + i);
+        }
+        this->_finish = this->_start + n;
+    }
+}
+```
+
+#### 获取分配器
+
+```c++
+constexpr allocator_type get_allocator() const noexcept
+{
+    return this->_allocator;
+}
+```
+
+### Element Access
+
+#### `operator[]`
+
+这个函数，标准库要求不检查是否越界，如果越界，则行为未定义
+
+```c++
+constexpr reference operator[](size_type pos)
+{   
+    // 标准库要求不检查范围
+    return *(this->_start + pos);
+}
+
+constexpr const_reference operator[](size_type pos) const
+{
+    // 标准库要求不检查范围
+    return *(this->_start + pos);
+}
+```
+
+#### `at()`
+
+`at()` 是 `operator[]` 的更安全版本，如果超出范围，会抛出错误
+
+```c++
+constexpr reference at(size_type pos) 
+{
+    if (pos >= this->size()) {
+        throw std::out_of_range("mystl::vector::at: pos out of range");
+    }
+    return *(this->_start + pos);
+}
+
+constexpr const_reference at(size_type pos) const
+{
+    if (pos >= this->size()) {
+        throw std::out_of_range("mystl::vector::at: pos out of range");
+    }
+    return *(this->_start + pos);
+}
+```
+
+#### `data()`
+
+```c++
+constexpr pointer data() noexcept
+{
+    return this->_start;
+}
+
+constexpr const_pointer data() const noexcept
+{
+    return this->_start;
+}
+```
+
+#### `front()`
+
+```c++
+constexpr reference front()
+{
+    return *this->_start;
+}
+
+constexpr const_reference front() const
+{
+    return *this->_start;
+}
+```
+
+#### `back()`
+
+```c++
+constexpr reference back()
+{
+    return *(this->_finish - 1);
+}
+
+constexpr const_reference back() const
+{
+    return *(this->_finish - 1);
+}
+```
 
 ### 迭代器相关函数
 
@@ -1176,3 +1706,566 @@ nonconst_iterator current_;
 
 - 避免将 current_ 声明为 int* const；
 - 这样在 operator++/-- 等操作中就不会报错。
+
+### Element Access
+
+```c++
+// operator[]
+constexpr reference operator[](size_type pos)
+{   
+    // 标准库要求不检查范围
+    return *(this->_start + pos);
+}
+
+constexpr const_reference operator[](size_type pos) const
+{
+    // 标准库要求不检查范围
+    return *(this->_start + pos);
+}
+
+// at()
+constexpr reference at(size_type pos) 
+{
+    if (pos >= this->size()) {
+        throw std::out_of_range("mystl::vector::at: pos out of range");
+    }
+    return *(this->_start + pos);
+}
+
+constexpr const_reference at(size_type pos) const
+{
+    if (pos >= this->size()) {
+        throw std::out_of_range("mystl::vector::at: pos out of range");
+    }
+    return *(this->_start + pos);
+}
+
+// data()
+constexpr pointer data() noexcept
+{
+    return this->_start;
+}
+
+constexpr const_pointer data() const noexcept
+{
+    return this->_start;
+}
+
+// front()
+// For a container c, the expression c.front() is equivalent to *c.begin().
+constexpr reference front()
+{
+    return *this->_start;
+}
+
+constexpr const_reference front() const
+{
+    return *this->_start;
+}
+
+// back()
+// For a container c, the expression c.back() is equivalent to *(--c.end()).
+constexpr reference back()
+{
+    return *(this->_finish - 1);
+}
+
+constexpr const_reference back() const
+{
+    return *(this->_finish - 1);
+}
+```
+
+### Capacity
+
+#### `reserve`
+
+函数保证强异常安全，同时，按照 cppreference，在要求的空间大于理论可以分配的最大空间时，抛出 `std::length_error`
+
+```c++
+constexpr void reserve(size_type new_cap) 
+{
+    if (new_cap <= capacity()) return;
+
+    if (new_cap > max_size()) {
+        throw std::length_error("mystl::vector::reserve: new_cap > max_size");
+    }
+
+    pointer new_start = this->_allocator.allocate(new_cap);
+    pointer new_finish = new_start;
+
+    try {
+        for (pointer p = this->_start; p != this->_finish; ++p, ++new_finish) {
+            std::allocator_traits<allocator_type>::construct(
+                this->_allocator, new_finish, std::move_if_noexcept(*p));
+        }
+    } catch (...) {
+        for (pointer p = new_start; p != new_finish; ++p) {
+            std::allocator_traits<allocator_type>::destroy(this->_allocator, p);
+        }
+        this->_allocator.deallocate(new_start, new_cap);
+        throw;
+    }
+
+    // 销毁旧数据
+    for (pointer p = this->_start; p != this->_finish; ++p) {
+        std::allocator_traits<allocator_type>::destroy(this->_allocator, p);
+    }
+
+    this->_allocator.deallocate(this->_start, capacity());
+
+    // 更新指针
+    this->_start = new_start;
+    this->_finish = new_finish;
+    this->_end_of_storage = new_start + new_cap;
+}
+```
+
+#### `shrink_to_fit`
+
+将 vector 的容量（capacity()）缩减为当前实际元素个数（size()），以减少内存占用。
+
+按照 cppreference：shrink_to_fit is a non-binding request to reduce capacity() to size().
+
+- 标准库 不强制要求 shrink_to_fit() 必须释放内存，它只是一个“请求”，实现可以选择忽略这个请求
+- 有些标准库不会实现
+
+| 实现                | 实际是否收缩容量 | 备注                          |
+|---------------------|------------------|-------------------------------|
+| **libstdc++ (GCC)** | ✅ 收缩          | 调用 `swap` trick            |
+| **libc++ (Clang)**  | ✅ 收缩          | 使用 `std::vector(tmp).swap(*this)` |
+| **MSVC**            | ⚠️ 有时不收缩     | 基于 allocator 策略决定       |
+
+另一方面，是否缩容还取决于底层 allocator 的实现
+
+- 有些底层系统或自定义分配器可能不是“字节精确分配”，而是按页（如 4KB）来分配
+  - 那么，如果一个 vector 当前容量是 4096，而实际只用了 4095 个元素，此时再去 shrink_to_fit() 是没有意义的。
+  - 因为你哪怕少用了一个元素，新的容量也不能小于一个页面，还是得分配 同样的 4KB 内存，也就是说不会节省任何内存
+- 另一种可能是，如果当前的 capacity 只比 size 大一点，那么这些内存的节省完全无法弥补性能和时间上的开销
+
+```c++
+constexpr void shrink_to_fit()
+{
+    if (capacity() > size()) {
+        vector tmp(this->_start, this->_finish, this->_allocator);
+        this->swap(tmp);
+    }
+}
+```
+
+### Modifiers
+
+#### `clear`
+
+清空 vector，size归零，但不会影响 capacity
+
+```c++
+constexpr void clear() noexcept
+{
+    for (pointer p = this->_start; p != this->_finish; ++p) {
+        this->_allocator.destroy(p);
+    }
+    this->_finish = this->_start;
+}
+```
+
+#### `erase`
+
+The iterator `pos` must be valid and dereferenceable. Thus the `end()` iterator (which is valid, but is not dereferenceable) cannot be used as a value for `pos`.
+The iterator `first` does not need to be dereferenceable if `first == last`: erasing an empty range is a no-op.
+返回最后被移除的元素的后一个元素
+
+- 如果 `pos` 是最后一个元素，返回 `end()`
+- 如果 `last == end()`， 返回更新后的 `end()`
+- 如果 `[first, last)` 为空，返回 `last`
+
+满足异常安全：只要移动操作不抛异常，erase 就不会抛异常
+
+```c++
+constexpr iterator erase(const_iterstor pos)
+{
+    return erase(pos, pos + 1);
+}
+
+constexpr iterator erase(const_iterator first, const_iterator last)
+{
+    pointer non_const_first = const_cast<pointer>(first);
+    pointer non_const_last = const_cast<pointer>(last);
+
+    if (first == last) {
+        return non_const_first;
+    }
+
+    pointer new_finish = this->_finish - (non_const_last - non_const_first);
+
+    // move 后面元素到前面
+    for (pointer p = non_const_last, d= non_const_first; p != this->_finish; ++p, ++d) {
+        *d = std::move(*p);
+    }
+
+    // destroy 多出来的尾部元素
+    for (pointer p = new_finish; p != this->_finish; ++p) {
+        this->_allocator.destroy(p);
+    }
+
+    this->finish = new_finish;
+    return non_const_first;
+}
+```
+
+##### 接口参数的改变
+
+早期 STL 中 erase 接受的是 iterator
+
+- 原因很简单——这些接口在早期 STL 中的目标就是修改容器本身，既然容器会被修改，那么参数类型也该是非 const 的 iterator。
+
+C++20 变成了 const_iterator
+
+- C++20 为了统一容器接口行为，引入了 std::erase_if, std::ranges 等机制，并在多个标准容器中 让所有可“只读访问”的迭代器都支持用作参数传递。
+- 这带来了几个好处：
+  - 更宽松的参数类型支持：
+    - `vec.erase(v.cbegin()); // OK, 不修改容器，旧接口不支持！`
+  - 提高与 `std::ranges` 的一致性
+    - 现代 `ranges`,`views` 的接口几乎全是基于 const_iterator 实现的，统一 const_iterator 是为了更好地支持
+
+#### `emplace`
+
+这个函数在 pos 前构造一个新的元素
+
+```c++
+template <typename... Args>
+constexpr iterator emplace(const_iterator pos, Args... args)
+{
+    size_type idx = pos - this->_start;
+    pointer insert_pos = this->_start + idx;
+
+    // 空间足够
+    if (this->_finish != this->_end_of_storage) {
+        if (insert_pos == this->_finish) {
+            this->emplace_back(std::forward<Args>(args)...);
+        } 
+        else {
+            // 构造末尾元素备份，然后 move [insert_pos, finish) 到 [insert_pos + 1, finish + 1)
+            this->_allocator.construct(this->_finish, std::move_if_noexcept(*(this->_finish - 1)));
+            _move_range(this->_allocator, insert_pos, this->_finish - 1, insert_pos + 1);
+            
+            // 在 insert_pos 处构造新元素
+            this->_allocator.destroy(insert_pos);
+            this->_allocator.construct(insert_pos, std::forward<Args>(args)...);
+        }
+
+        ++this->_finish;
+    }
+    else {
+        // 空间不足，重新分配
+        const size_type oldSize = this->size();
+        const newCapacity = oldSize == 0 ? 1 : oldSize * 2;
+
+        pointer new_start = this->_allocator.allocate(newCapacity);
+        pointer new_finish = new_start;
+
+        try {
+            _move_range(this->_allocator, this->_start, insert_pos, new_start);
+            new_finish = new_start + idx;
+
+            this->_allocator.construct(new_finish, std::forward<Args>(args)...);
+            ++new_finish;
+
+            _move_range(this->_allocator, insert_pos, this->_finish, new_finish);
+            new_finish += this->_finish - insert_pos;
+        } 
+        catch (...) {
+            for (pointer p = new_start; p != new_finish; ++p) {
+                this->_allocator.destroy(p);
+            }
+            this->_allocator.deallocate(new_start, newCapacity);
+            throw;
+        }
+
+        for (pointer p = this->_start; p != this->_finish; ++p) {
+            this->_allocator.destroy(p);
+        }
+        this->_allocator.deallocate(this->_start, this->capacity());
+
+        this->_start = new_start;
+        this->_finish = new_finish;
+        this->_end_of_storage = new_start + newCapacity;
+    }
+
+    return this->_start + idx;
+}
+```
+
+#### `void emplace_back(Args&&... args)`
+
+这个函数用于向 vector 中添加元素，并在容量不足时触发扩容
+
+```c++
+template <typename... Args>
+void emplace_back(Args&&... args)
+{
+  if (this->_finish != this->_end_of_storage) {
+      this->_allocator.construct(this->_finish, std::forward<Args>(args)...);
+      ++this->_finish;
+  }
+  else {
+      _realloc_insert(std::forward<Args>(args)...);
+  }
+}
+```
+
+#### insert
+
+```c++
+//  Inserts a copy of value before pos.
+//  Returns an iterator pointing to the inserted value.
+constexpr iterator insert(const_iterator pos, const T& value)
+{
+    return emplace(pos, value);
+}
+
+constexpr iterator insert(const_iterator pos, T&& value)
+{
+    return emplace(pos, std::move(value));
+}
+
+constexpr iterator insert(const_iterator pos, size_type count, const T& value)
+{
+    if (count == 0) {
+        return const_cast<iterator>(pos);
+    }
+
+    size_type idx = pos - this->_start;
+    pointer insert_pos = this->_start + idx;
+
+    // 空间足够
+    if (this->capacity() >= this->size() + count) {
+        pointer old_finish = this->_finish;
+        pointer move_src = insert_pos;
+        pointer move_dst = insert_pos + count;
+
+        // move [insert_pos, finish) 到 [insert_pos + count, finish + count)
+        _move_range(this->_allocator, move_src, old_finish, move_dst);
+
+        // 在 insert_pos 处构造新元素
+        _uninitialized_fill_n(this->_allocator, insert_pos, count, value);
+
+        this->_finish += count;
+    }
+    // 空间不足
+    else {
+        const size_type oldSize = this->size();
+        const size_type newCapacity = oldSize + std::max(count, oldSize);
+        pointer new_start = this->_allocator.allocate(newCapacity);
+        pointer new_finish = new_start;
+
+        try {
+            // 构造前段 [0, idx)
+            for (size_type i = 0; i < idx; ++i, ++new_finish) {
+                this->_allocator.construct(new_finish, std::move_if_noexcept(this->_start[i]));
+            }
+
+            _uninitialized_fill_n(this->_allocator, new_finish, count, value);
+            new_finish += count;
+
+            // 构造后段 [idx, oldSize)
+            for (size_type i = idx; i < oldSize; ++i, ++new_finish) {
+                this->_allocator.construct(new_finish, std::move_if_noexcept(this->_start[i]));
+            }
+        }
+        catch(...) {
+            for (pointer p = new_start; p != new_finish; ++p) {
+                this->_allocator.destroy(p);
+            }
+            this->_allocator.deallocate(new_start, newCapacity);
+            throw;
+        }
+
+        for (pointer p = this->_start; p != this->_finish; ++p) {
+            this->_allocator.destroy(p);
+        }
+        this->_allocator.deallocate(this->_start, this->capacity());
+
+        this->_start = new_start;
+        this->_finish = new_finish;
+        this->_end_of_storage = new_start + newCapacity;
+    }
+
+    return this->_start + idx;
+}
+
+// 不保证异常安全
+template<typename InputIt>
+requires std::input_iterator<InputIt> &&
+            std::constructible_from<T, typename std::iterator_traits<InputIt>::reference> &&
+            (!std::integral<InputIt>)
+constexpr iterator insert(const_iterator pos, InputIt first, InputIt last)
+{
+    size_type insertCount = static_cast<size_type>(std::distance(first, last));
+    if (insertCount == 0) {
+        return const_cast<iterator>(pos);
+    }
+
+    size_type insertOffset = static_cast<size_type>(pos - this->_start);
+    pointer insertPos = this->_start + insertOffset;
+
+    if (static_cast<size_type>(this->_end_of_storage - this->_finish) >= insertCount) {
+        // 后段先移动到新位置（后向构造）
+        const size_type tailCount = static_cast<size_type>(this->_finish - insertPos);
+        if (tailCount > 0) {
+            _move_range(this->_allocator, insertPos, this->_finish, insertPos + insertCount);
+        }
+
+        // 中间插入新元素
+        pointer cur = insertPos;
+        try {
+            for (; first != last; ++first, ++cur) {
+                std::allocator_traits<allocator_type>::construct(
+                    this->_allocator, cur, std::move_if_noexcept(*first)
+                );
+            }
+        } catch(...) {
+            for (pointer p = insertPos; p != cur; ++p) {
+                std::allocator_traits<allocator_type>::destroy(this->_allocator, p);
+            }
+            throw;
+        }
+
+        this->_finish += insertCount;
+    }
+    else {
+        // 容量不足，分配新内存
+        const size_type oldSize = this->size();
+        const size_type newCapacity = std::max(oldSize + insertCount, oldSize * 2);
+
+        pointer new_start = std::allocator_traits<allocator_type>::allocate(this->_allocator, newCapacity);
+        pointer new_finish = new_start;
+
+        try {
+            // 1. 复制/move 插入点前段 [0, insertOffset)
+            for (size_type i = 0; i < insertOffset; ++i, ++new_finish)
+                std::allocator_traits<allocator_type>::construct(this->_allocator, new_finish, std::move_if_noexcept(this->_start[i]));
+
+            // 2. 插入新元素
+            for (; first != last; ++first, ++new_finish)
+                std::allocator_traits<allocator_type>::construct(this->_allocator, new_finish, *first);
+
+            // 3. 复制/move 尾段 [insertOffset, oldSize)
+            for (size_type i = insertOffset; i < oldSize; ++i, ++new_finish)
+                std::allocator_traits<allocator_type>::construct(this->_allocator, new_finish, std::move_if_noexcept(this->_start[i]));
+        } catch (...) {
+            for (pointer p = new_start; p != new_finish; ++p)
+                std::allocator_traits<allocator_type>::destroy(this->_allocator, p);
+            this->_allocator.deallocate(new_start, newCapacity);
+            throw;
+        }
+        // 清理旧资源
+        for (pointer p = this->_start; p != this->_finish; ++p)
+            std::allocator_traits<allocator_type>::destroy(this->_allocator, p);
+        this->_allocator.deallocate(this->_start, this->capacity());
+
+        this->_start = new_start;
+        this->_finish = new_finish;
+        this->_end_of_storage = new_start + newCapacity;
+        insertPos = this->_start + insertOffset;  // 更新 insertPos 指针
+    }
+
+    return insertPos;
+}
+
+// 直接转发即可
+constexpr iterator insert(const_iterator pos, std::initializer_list<T> ilist)
+{
+    return insert(pos, ilist.begin(), ilist.end());
+}
+```
+
+需要注意一点是，按照标准库，`insert`　不保证异常安全，即在移动元素后，如果在新位置构造元素的过程抛出异常，函数结果是未定义的
+
+#### push_back
+
+相较于 emplace_back，其本质操作是复制（或移动）一个元素到容器尾部，所以总是需要一次拷贝或移动构造。
+
+在实现上，直接转发到 emplace_back 即可
+
+```c++
+constexpr void push_back(const T& value)
+{
+    emplace_back(value);
+}
+
+constexpr void push_back(T&& value)
+{
+    emplace_back(std::move(value));
+}
+```
+
+#### pop_back
+
+从末尾弹出一个元素，如果弹出前 vector 为空，那么结果未定义
+
+- 按照 cppreference 和 标准库的做法，不会对 vector 是否为空做检查
+- 这么做是出于性能的考虑
+
+```c++
+constexpr void pop_back()
+{
+    --this->_finish;
+    this->_allocator.destroy(this->_finish);
+}
+```
+
+#### resize
+
+```c++
+// resize
+/*
+Resizes the container to contain count elements:
+    If count is equal to the current size, does nothing.
+    If the current size is greater than count, the container is reduced to its first count elements.
+    If the current size is less than count, then:
+        1) Additional default-inserted elements(since C++11) are appended.
+        2) Additional copies of value are appended.
+*/
+constexpr void resize(size_type conut)
+{
+    if (count < this->size()) {
+        pointer new_finish = this->_start + count;
+        for (pointer p = new_finish; p != this->_finish; ++p) {
+            this->_allocator.destroy(p);
+        }
+        this->_finish = new_finish;
+    }
+    else if (count > this->size()) {
+        if (count > this->capacity()) {
+            reserve(count);
+        }
+        for (pointer p = this->_finish; p != this->_start + count; ++p) {
+            // if T is not DefaultInsertable or MoveInsertable into vector,the behavior is undefined
+            this->_allocator.construct(p, T{});
+        }
+        this->_finish = this->_start + count;
+    }
+}
+
+constexpr void resize(size_type count, const value_type& value)
+{
+    if (count < this->size()) {
+        pointer new_finish = this->_start + count;
+        for (pointer p = new_finish; p != this->_finishl ++p) {
+            this->_allocator.destroy(p);
+        }
+        this->_finish = new_finish;
+    }
+    else if (count > this->size()) {
+        if (count > this->capacity()) {
+            reserve(count);
+        }
+        // if T is not CopyInsertable into vector,the behavior is undefined
+        for (pointer p = this->_finish; p != this->_start + count; ++p) {
+            this->_allocator.construct(p, value);
+        }
+        this->_finish = this->_start + count;
+    }
+}
+```

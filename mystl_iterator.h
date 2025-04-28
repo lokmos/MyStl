@@ -544,9 +544,23 @@ __distance_impl(RandomIt first, RandomIt last, random_access_iterator_tag)
 
 template <typename Iter>
 typename iterator_traits<Iter>::difference_type
-distance(Iter first, Iter last) {
-    return __distance_impl(first, last, typename iterator_traits<Iter>::iterator_category());
+distance(Iter first, Iter last)
+{
+    using category = typename iterator_traits<Iter>::iterator_category;
+
+    if constexpr (std::is_base_of_v<random_access_iterator_tag, category> ||
+                  std::is_base_of_v<std::random_access_iterator_tag, category>) {
+        return last - first;
+    } else {
+        typename iterator_traits<Iter>::difference_type n = 0;
+        while (first != last) {
+            ++first;
+            ++n;
+        }
+        return n;
+    }
 }
+
 
 } // namespace mystl
 
