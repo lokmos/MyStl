@@ -536,6 +536,110 @@ public:
         return *this;
     }
 
+    // assign
+    void assign(size_type count, const T& value)
+    {
+        size_type n = _finish - _start;
+        // if c > count, there is enough elements
+        if (n >= count) {
+            // reuse the first count elements
+            auto it = _start;
+            for (size_type i = 0; i < count; ++i, ++it) {
+                if constexpr (std::is_trivially_copy_assignable<T>::value) {
+                    *it = value;
+                } else {
+                    std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), value);
+                }
+            }
+
+            // destroy the rest elements
+            auto new_finish = _start + static_cast<difference_type>(count);
+            if constexpr (!std::is_trivially_destructible<T>::value) {
+                for (auto cur = new_finish; cur != _finish; ++cur) {
+                    std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*cur));
+                }
+            }
+
+            // free the rest blocks
+            for (auto cur_node = new_finish._node; cur_node != _finish._node; ++cur_node) {
+                std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *cur_node, buffer_size());
+            }
+
+            _finish = new_finish;
+        }
+        else {
+            // current elements are not enough
+            // reuse the first n elements
+            for (auto it = _start; it != _finish; ++it) {
+                if constexpr (std::is_trivially_copy_assignable<T>::value) {
+                    *it = value;
+                } else {
+                    std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), value);
+                }
+            }
+
+            // emplace the rest elements
+            for (size_type i = n; i < count; ++i) {
+                emplace_back(value);
+            }
+        }
+    }
+
+    template <typename InputIt>
+    void assign (InputIt first, InputIt last,
+                typename std::enable_if<!std::is_integral<InputIt>::value>::type* = nullptr)
+    {
+        // for random access iterator, we can use distance to get the number of elements
+        if constexpr (std::is_same<typename std::iterator_traits<InputIt>::iterator_category, std::random_access_iterator_tag>::value) {
+            size_type count = mystl::distance(first, last);
+            size_type n = _finish - _start;
+
+            if (n >= count) {
+                auto it = _start;
+                for (size_type i = 0; i < count; ++i, ++it, ++first) {
+                    if constexpr (std::is_trivially_copy_assignable<T, typename std::iterator_traits<InputIt>::value_type>::value) {
+                        *it = *first;
+                    } else {
+                        std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), *first);
+                    }
+                }
+
+                auto new_finish = _start + static_cast<difference_type>(count);
+                if constexpr (!std::is_trivially_destrutible<T>::value) {
+                    for (auto cur = new_finish; cur != _finish; ++cur) {
+                        std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*cur));
+                    }
+                }
+
+                for (auto cur_node = new_finish._node; cur_node != _finish._node; ++cur_node) {
+                    std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *cur_node, buffer_size());
+                }
+
+                _finish = new_finish;
+            } else {
+                // current elements are not enough
+                for (auto it = _start; it != _finish; ++it, ++first) {
+                    if constexpr (std::is_trivially_copy_assignable<T, typename std::iterator_traits<InputIt>::value_type>::value) {
+                        *it = *first;
+                    } else {
+                        std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), *first);
+                    }
+                }
+
+                for (; first != last; ++first) {
+                    emplace_back(*first);
+                }
+            }
+        }
+        else {
+            // for forward iterator, we can't use distance to get the number of elements
+            clear();
+            for (; first != last; ++first) {
+                emplace_back(*first);
+            }
+        }
+    }
+
 public:
 // Element Access
     // 随机访问，不做边界检查
@@ -602,6 +706,19 @@ public:
 
 public:
 // Modifier
+    // clear
+    void clear() noexcept
+    {
+        if constexpr (!std::is_trivially_destructible<T>::value) {
+            for (auto it = _start; it != _finish; ++it) {
+                std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*it));
+            }
+        }
+
+        _deallocate_all_blocks();
+        _initialize_map(0);
+    }
+
     template <typename... Args>
     reference emplace_back(Args&&... args)
     {
