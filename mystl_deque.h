@@ -715,8 +715,17 @@ public:
             }
         }
 
-        _deallocate_all_blocks();
-        _initialize_map(0);
+        // free all blocks, maintian one block
+        if (_start._node != _finish._node) {
+            // maintain the first block
+            pointer* first_node = _start._node;
+
+            for (auto node = first_node + 1; node != _finish._node; ++node) {
+                std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *node, buffer_size());
+            }
+        }
+
+        _finish = _start;
     }
 
     template <typename... Args>
