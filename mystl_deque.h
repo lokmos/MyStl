@@ -640,6 +640,17 @@ public:
         }
     }
 
+    void assign(std::initializer_list<value_type> ilist)
+    {
+        assign(ilist.begin(), ilist.end());
+    }
+
+    // get_allocator
+    allocator_type get_allocator() const noexcept
+    {
+        return _alloc;
+    }
+
 public:
 // Element Access
     // 随机访问，不做边界检查
@@ -668,6 +679,30 @@ public:
             throw std::out_of_range("deque::at: index out of range");
         }
         return operator[](pos);
+    }
+
+    // front
+    // if dq is empty, the behavior is undefined
+    reference front()
+    {
+        return *_start;
+    }
+
+    const_reference front() const
+    {
+        return *_start;
+    }
+
+    // back
+    // if dq is empty, the behavior is undefined
+    reference back()
+    {
+        return *(_finish - 1);
+    }
+
+    const_reference back() const
+    {
+        return *(_finish - 1);
     }
 
 public:
@@ -1172,6 +1207,172 @@ public:
             return deque::buffer_size();
         }
     };
+
+    class reverse_iterator
+    {
+        // 让 const_reverse_iterator 可以访问 reverse_iterator 的私有成员
+        friend class const_reverse_iterator;
+
+        // 让 deque 可以访问 reverse_iterator 的私有成员
+        friend class deque<T, Alloc>;
+
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = T;
+        using difference_type = std::ptrdiff_t;
+        using pointer = T*;
+        using reference = T&;
+        using map_pointer = pointer*;
+
+    public:
+        reverse_iterator() noexcept
+            : _cur(nullptr), _first(nullptr), _last(nullptr), _node(nullptr) {}
+        reverse_iterator(pointer cur, pointer first, pointer last, pointer* node) noexcept
+            : _cur(cur), _first(first), _last(last), _node(node) {}
+        
+
+        reference operator*() const noexcept { return *_cur; };
+        pointer operator->() const noexcept { return _cur; };
+
+        // 前缀++
+        reverse_iterator& operator++() noexcept
+        {
+            if (_cur == _first) {
+                --_node;
+                _first = *_node;
+                _last = _first + static_cast<difference_type>(_buffer_size());
+                _cur = _last;
+            }
+            else {
+                --_cur;
+            }
+            return *this;
+        }
+
+        // 后缀++
+        reverse_iterator operator++(int) noexcept
+        {
+            reverse_iterator tmp = *this;
+            ++(*this);
+            return tmp;
+        }
+
+        // 前缀--
+        reverse_iterator& operator--() noexcept
+        {
+            if (_cur == _last) {
+                ++_node;
+                _first = *node;
+                _cur = _first;
+                _last = _first + static_cast<difference_type>(_buffer_size());
+            }
+            else {
+                ++_cur;
+            }
+            return *this;
+        }
+
+        // 后缀--
+        reverse_iterator operator--(int) noexcept
+        {
+            reverse_iterator tmp = *this;
+            --(*this);
+            return tmp;
+        }
+
+        // += n
+        reverse_iterator& operator+=(difference_type n)
+        {
+            const difference_type buf = static_cast<difference_type>(_buffer_size());
+            // 对于反向迭代器，+= n 等价于正向迭代器的 -= n
+            difference_type offset = (_cur - _first) - n;
+            difference_type block = offset / buf;
+            difference_type idx = offset % buf;
+
+            if (idx < 0) {
+                idx += buf;
+                --block;
+            }
+
+            _node += block;
+            _first = *_node;
+            _last = _first + buf;
+            _cur = _first + idx;
+            return *this;
+        }
+
+        // + n
+        reverse_iterator operator+ (difference_type n) const
+        {
+            reverse_iterator tmp = *this;
+            return tmp += n;
+        }
+
+        // -= n
+        reverse_iterator& operator-=(difference_type n)
+        {
+            return *this += -n;
+        }
+
+        // - n
+        reverse_iterator operator- (difference_type n) const
+        {
+            reverse_iterator tmp = *this;
+            return tmp -= n;
+        }
+
+        // - reverse_iterator
+        difference_type operator-(const reverse_iterator& other) const noexcept
+        {
+            difference_type block_diff = _node - other._node;
+            difference_type cur_diff = (other._last - other._cur) - (_last - _cur);
+            return block_diff * static_cast<difference_type>(_buffer_size()) + cur_diff;
+        }
+
+        // [] 运算符
+        reference operator[](difference_type n) const noexcept
+        {
+            return *(*this + n);
+        }
+
+        // 关系比较
+        bool operator==(const reverse_iterator& other) const noexcept
+        {
+            return _cur == other._cur;
+        }
+        bool operator!=(const reverse_iterator& other) const noexcept
+        {
+            return _cur != other._cur;
+        }
+        bool operator<(const reverse_iterator& other) const noexcept
+        {
+            return (_node == other._node)
+                    ? (_cur > other._cur)
+                    : (_node > other._node);
+        }
+        bool operator>(const reverse_iterator& other) const noexcept
+        {
+            return other < *this;
+        }
+        bool operator<=(const reverse_iterator& other) const noexcept
+        {
+            return !(*this > other);
+        }
+        bool operator>=(const reverse_iterator& other) const noexcept
+        {
+            return !(*this < other);
+        }
+
+    private:
+        pointer _cur;
+        pointer _first;
+        pointer _last;
+        map_pointer _node;
+
+        static size_type _buffer_size() {
+            return deque::buffer_size();
+        }
+    }
 };
 }
 
