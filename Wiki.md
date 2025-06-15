@@ -3212,9 +3212,187 @@ void assign(std::initializer_list<value_type> ilist)
 }
 ```
 
+## Capacity
+### `shrink_to_fit`
+```c++
+// shrink_to_fit
+void shrink_to_fit() 
+{
+    // 如果为空或只有一个 block，无需收缩
+    if (empty() || (_start._node == _finish._node)) {
+        return;
+    }
+
+    try {
+        // 1. 计算实际使用的元素数量和 blocks
+        size_type element_count = size();
+        size_type used_blocks = static_cast<size_type>(_finish._node - _start._node) + 1;
+        
+        // 2. 判断是否值得收缩
+        // 条件：map 大小超过使用量的 2 倍，或者浪费的内存超过 4KB
+        bool should_shrink = _map_size > used_blocks * 2 || 
+                            (_map_size - used_blocks) * buffer_size() * sizeof(T) > 4096;
+        
+        if (!should_shrink) {
+            return;
+        }
+
+        // 3. 计算新的 map 大小，保留一些增长空间
+        size_type new_map_size = used_blocks + 2;  // 前后各预留一个位置
+
+        // 4. 分配新的 map
+        pointer* new_map = nullptr;
+        try {
+            new_map = map_traits_type::allocate(_map_alloc, new_map_size);
+        }
+        catch (...) {
+            // 分配失败，保持原状
+            return;
+        }
+
+        // 5. 设置新的起始位置，保持在中间
+        pointer* new_start = new_map + 1;
+
+        // 6. 如果元素数量很少且内存过于分散，尝试紧凑存储
+        if (element_count < buffer_size() && used_blocks > 1) {
+            // 分配单个连续的 block
+            pointer new_block = nullptr;
+            try {
+                new_block = std::allocator_traits<allocator_type>::allocate(_alloc, buffer_size());
+                
+                // 移动所有元素到新 block
+                size_type i = 0;
+                for (auto it = _start; it != _finish; ++it, ++i) {
+                    std::allocator_traits<allocator_type>::construct(
+                        _alloc, 
+                        new_block + i, 
+                        std::move(*it)
+                    );
+                }
+
+                // 释放原有元素
+                if constexpr (!std::is_trivially_destructible<T>::value) {
+                    for (auto it = _start; it != _finish; ++it) {
+                        std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*it));
+                    }
+                }
+
+                // 释放原有 blocks
+                for (pointer* node = _start._node; node <= _finish._node; ++node) {
+                    std::allocator_traits<allocator_type>::deallocate(_alloc, *node, buffer_size());
+                }
+
+                // 设置新的 block
+                new_start[0] = new_block;
+                
+                // 更新迭代器
+                _map = new_map;
+                _map_size = new_map_size;
+                
+                _start._node = new_start;
+                _start._first = new_block;
+                _start._last = new_block + buffer_size();
+                _start._cur = new_block;
+                
+                _finish = _start;
+                _finish._cur += element_count;
+                
+                // 释放旧的 map
+                map_traits_type::deallocate(_map_alloc, _map, _map_size);
+                
+                return;
+            }
+            catch (...) {
+                // 如果紧凑化失败，回退到普通的收缩
+                if (new_block) {
+                    std::allocator_traits<allocator_type>::deallocate(_alloc, new_block, buffer_size());
+                }
+            }
+        }
+
+        // 7. 常规收缩：复制有效的 block 指针
+        for (size_type i = 0; i < used_blocks; ++i) {
+            new_start[i] = _start._node[i];
+        }
+
+        // 8. 释放多余的 blocks
+        for (pointer* node = _map; node < _start._node; ++node) {
+            if (*node) {
+                std::allocator_traits<allocator_type>::deallocate(_alloc, *node, buffer_size());
+            }
+        }
+        for (pointer* node = _finish._node + 1; node < _map + _map_size; ++node) {
+            if (*node) {
+                std::allocator_traits<allocator_type>::deallocate(_alloc, *node, buffer_size());
+            }
+        }
+
+        // 9. 释放旧的 map
+        pointer* old_map = _map;
+        size_type old_map_size = _map_size;
+
+        // 10. 更新成员
+        _map = new_map;
+        _map_size = new_map_size;
+
+        // 11. 更新迭代器
+        difference_type start_offset = _start._cur - _start._first;
+        difference_type finish_offset = _finish._cur - _finish._first;
+
+        _start._node = new_start;
+        _start._first = *new_start;
+        _start._last = _start._first + buffer_size();
+        _start._cur = _start._first + start_offset;
+
+        _finish._node = new_start + (used_blocks - 1);
+        _finish._first = *_finish._node;
+        _finish._last = _finish._first + buffer_size();
+        _finish._cur = _finish._first + finish_offset;
+
+        // 12. 释放旧的 map
+        map_traits_type::deallocate(_map_alloc, old_map, old_map_size);
+    }
+    catch (...) {
+        // 如果发生任何异常，保持容器不变
+    }
+}
+```
+
+
 ## Modifier
 
-### emplace_back
+### `clear`
+Erases all elements from the container. After this call, `size()` returns zero.
+
+Invalidates any references, pointers, and iterators referring to contained elements. Any past-the-end iterators are also invalidated.
+
+在这个操作之后，只会保留一个 block
+
+```c++
+void clear() noexcept
+{
+    if constexpr (!std::is_trivially_destructible<T>::value) {
+        for (auto it = _start; it != _finish; ++it) {
+            std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*it));
+        }
+    }
+
+    // free all blocks, maintian one block
+    if (_start._node != _finish._node) {
+        // maintain the first block
+        pointer* first_node = _start._node;
+
+        for (auto node = first_node + 1; node != _finish._node; ++node) {
+            std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *node, buffer_size());
+        }
+    }
+
+    _finish = _start;
+}
+```
+
+
+### `emplace_back`
 
 Appends a new element to the end of the container. The element is constructed through std::allocator_traits::construct, which typically uses placement new to construct the element in-place at the location provided by the container. The arguments `args...` are forwarded to the constructor as `std::forward<Args>(args)...`
 All iterators (including the end() iterator) are invalidated. No references are invalidated.
