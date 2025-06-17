@@ -607,7 +607,7 @@ public:
         return this->_finish;
     }
 
-    // 按照cppreference，reverse_iterator 实际上 持有的是指向其要访问的元素“下一位”的迭代器”
+    // 按照cppreference，reverse_iterator 实际上 持有的是指向其要访问的元素"下一位"的迭代器"
     // rbegin() 返回最后一个元素，因此其应当指向 finish，这样解引用的时候，就可以顺利访问到最后一个元素
     constexpr reverse_iterator rbegin() noexcept
     {
@@ -1079,7 +1079,6 @@ private:
     template <typename... Args>
     void _realloc_insert(Args&&... args)
     {
-        const size_type old_size = this->_finish - this->_start;
         const size_type old_capacity = this->_end_of_storage - this->_start;
         const size_type new_capacity = old_capacity == 0 ? 1 : old_capacity * 2;
 

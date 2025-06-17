@@ -162,7 +162,7 @@ TEST(VectorAssignTest, MoveAssign_Basic) {
 
 TEST(VectorAssignTest, MoveAssign_SelfMove) {
     mystl::vector<int> v{1,2,3};
-    v = std::move(v);  // 自身移动赋值
+    v = v;  // 自身赋值
     // 行为等同于 self-assignment：不出错，内容不变
     EXPECT_EQ(v.size(), 3);
     expect_equal(v, std::vector<int>({1,2,3}));
@@ -386,7 +386,6 @@ TEST(VectorCapacityTest, SizeAfterPushBack) {
 
 TEST(VectorCapacityTest, CapacityAfterReserve) {
     mystl::vector<int> v{1,2,3};
-    size_t old_cap = v.capacity();
     v.reserve(10);
     EXPECT_GE(v.capacity(), 10u);
     // 调用 reserve 并不改变已有元素

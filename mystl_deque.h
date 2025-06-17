@@ -41,6 +41,8 @@ public:
     // iterator 是元素级的，不是块级的
     class iterator;
     class const_iterator;
+    class reverse_iterator;
+    class const_reverse_iterator;
 
 public:
 // construct
@@ -166,7 +168,7 @@ public:
         constexpr bool propagate = std::allocator_traits<allocator_type>::propagate_on_container_move_assignment::value;
         constexpr bool always_eq = std::allocator_traits<allocator_type>::is_always_equal::value;
         if (propagate || always_eq || other._alloc == _alloc) {
-            // —— 直接“窃取” other 的底层存储 —— //
+            // —— 直接"窃取" other 的底层存储 —— //
             _map = other._map;
             _map_size = other._map_size;
             _start = other._start;
@@ -275,8 +277,7 @@ public:
                 }
             }
 
-            _finish = _start;
-            _finish += static_cast<difference_type>(n);
+            _finish = dst;
 
             for (iterator it = other._start; it != other._finish; ++it) {
                 std::allocator_traits<allocator_type>::destroy(other._alloc, std::addressof(*it));
@@ -335,13 +336,11 @@ public:
             return *this;
         }
 
-        // 1. 保存旧分配器的引用，用于后续可能的内存释放
         allocator_type old_alloc = _alloc;
         map_allocator_type old_map_alloc = _map_alloc;
 
-        // 2. 检查分配器传播
         bool alloc_changed = false;
-        if constexpr (std::allocator_traits<allocator_type>::propagete_on_container_copy_assignment::value) {
+        if constexpr (std::allocator_traits<allocator_type>::propagate_on_container_copy_assignment::value) {
             if (_alloc != other._alloc) {
                 alloc_changed = true;
             }
@@ -349,7 +348,6 @@ public:
             _map_alloc = other._map_alloc;
         }
 
-        // 3. 如果分配器发生变化，必须用旧分配器释放内存
         if (alloc_changed) {
             // 用旧分配器释放资源
             if constexpr (!std::is_trivially_destructible<T>::value) {
@@ -378,7 +376,7 @@ public:
             size_type n = mystl::distance(other._start, other._finish);
             size_type buf_sz = buffer_size();
             size_type nblocks = n ? (n + buf_sz - 1) / buf_sz : 0;
-            _initialize_map(nblokcs);
+            _initialize_map(nblocks);
 
             iterator it = _start;
             for (const_reference v : other) {
@@ -392,11 +390,10 @@ public:
             }
 
             _finish = it;
-            _finish += static_cast<difference_type>(n);
         }
         else {
             // 5. 如果分配器没变，可以简单地释放旧资源并复制
-            if constexpr (!std::is_trivially_copy_constructible<T>::value) {
+            if constexpr (!std::is_trivially_destructible<T>::value) {
                 for (auto it = _start; it != _finish; ++it) {
                     std::allocator_traits<allocator_type>::destroy(old_alloc, std::addressof(*it));
                 }
@@ -421,7 +418,6 @@ public:
             }
 
             _finish = it;
-            _finish += static_cast<difference_type>(n);
         }
         return *this;
     }
@@ -438,10 +434,10 @@ public:
         // 1. 检查分配器传播
         if constexpr (std::allocator_traits<allocator_type>::propagate_on_container_move_assignment::value) {
             _alloc = std::move(other._alloc);
-            _map_alloc = std::move(other._map_alloc)
+            _map_alloc = std::move(other._map_alloc);
         }
 
-        // 2. 如果分配器允许，直接“窃取”other的资源
+        // 2. 如果分配器允许，直接"窃取"other的资源
         constexpr bool propagate = std::allocator_traits<allocator_type>::propagate_on_container_move_assignment::value;
         constexpr bool always_equal = std::allocator_traits<allocator_type>::is_always_equal::value;
         if (propagate || always_equal || _alloc == other._alloc) {
@@ -513,7 +509,7 @@ public:
                 std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*it));
             }
         }
-        _dealloc_all_blocks();
+        _deallocate_all_blocks();
 
         // 2. assign new resources
         size_type n = ilist.size();
@@ -561,8 +557,8 @@ public:
             }
 
             // free the rest blocks
-            for (auto cur_node = new_finish._node; cur_node != _finish._node; ++cur_node) {
-                std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *cur_node, buffer_size());
+            for (auto cur_node = new_finish._node + 1; cur_node <= _finish._node; ++cur_node) {
+                std::allocator_traits<allocator_type>::deallocate(_alloc, *cur_node, buffer_size());
             }
 
             _finish = new_finish;
@@ -586,10 +582,9 @@ public:
     }
 
     template <typename InputIt>
-    void assign (InputIt first, InputIt last,
+    void assign(InputIt first, InputIt last,
                 typename std::enable_if<!std::is_integral<InputIt>::value>::type* = nullptr)
     {
-        // for random access iterator, we can use distance to get the number of elements
         if constexpr (std::is_same<typename std::iterator_traits<InputIt>::iterator_category, std::random_access_iterator_tag>::value) {
             size_type count = mystl::distance(first, last);
             size_type n = _finish - _start;
@@ -597,7 +592,7 @@ public:
             if (n >= count) {
                 auto it = _start;
                 for (size_type i = 0; i < count; ++i, ++it, ++first) {
-                    if constexpr (std::is_trivially_copy_assignable<T, typename std::iterator_traits<InputIt>::value_type>::value) {
+                    if constexpr (std::is_trivially_copy_assignable<T>::value) {
                         *it = *first;
                     } else {
                         std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), *first);
@@ -605,21 +600,21 @@ public:
                 }
 
                 auto new_finish = _start + static_cast<difference_type>(count);
-                if constexpr (!std::is_trivially_destrutible<T>::value) {
+                if constexpr (!std::is_trivially_destructible<T>::value) {
                     for (auto cur = new_finish; cur != _finish; ++cur) {
                         std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*cur));
                     }
                 }
 
-                for (auto cur_node = new_finish._node; cur_node != _finish._node; ++cur_node) {
-                    std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *cur_node, buffer_size());
+                // 释放多余的块
+                for (auto cur_node = new_finish._node + 1; cur_node <= _finish._node; ++cur_node) {
+                    std::allocator_traits<allocator_type>::deallocate(_alloc, *cur_node, buffer_size());
                 }
 
                 _finish = new_finish;
             } else {
-                // current elements are not enough
                 for (auto it = _start; it != _finish; ++it, ++first) {
-                    if constexpr (std::is_trivially_copy_assignable<T, typename std::iterator_traits<InputIt>::value_type>::value) {
+                    if constexpr (std::is_trivially_copy_assignable<T>::value) {
                         *it = *first;
                     } else {
                         std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it), *first);
@@ -632,7 +627,6 @@ public:
             }
         }
         else {
-            // for forward iterator, we can't use distance to get the number of elements
             clear();
             for (; first != last; ++first) {
                 emplace_back(*first);
@@ -755,8 +749,8 @@ public:
             // maintain the first block
             pointer* first_node = _start._node;
 
-            for (auto node = first_node + 1; node != _finish._node; ++node) {
-                std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, *node, buffer_size());
+            for (auto node = first_node + 1; node <= _finish._node; ++node) {
+                std::allocator_traits<allocator_type>::deallocate(_alloc, *node, buffer_size());
             }
         }
 
@@ -878,7 +872,7 @@ private:
         /*
             尽量将旧 block 中的内容放在居中位置，并确保前面有 add_front 个 block
             (new_map_size - old_nodes)：空槽位总数
-            (new_map_size - old_nodes) / 2：把这批空槽位平均分成前后一半，这样旧的 block 指针就能“居中”放在新数组中间
+            (new_map_size - old_nodes) / 2：把这批空槽位平均分成前后一半，这样旧的 block 指针就能"居中"放在新数组中间
             + add_front：标记你想在「这批居中空位之上」再多留 add_front 个槽位
         */
         pointer* new_start = new_map + (new_map_size - old_nodes) / 2 + add_front;
@@ -1227,12 +1221,12 @@ public:
     public:
         reverse_iterator() noexcept
             : _cur(nullptr), _first(nullptr), _last(nullptr), _node(nullptr) {}
-        reverse_iterator(pointer cur, pointer first, pointer last, pointer* node) noexcept
+        reverse_iterator(pointer cur, pointer first, pointer last, map_pointer node) noexcept
             : _cur(cur), _first(first), _last(last), _node(node) {}
         
 
-        reference operator*() const noexcept { return *_cur; };
-        pointer operator->() const noexcept { return _cur; };
+        reference operator*() const noexcept { return *_cur; }
+        pointer operator->() const noexcept { return _cur; }
 
         // 前缀++
         reverse_iterator& operator++() noexcept
@@ -1241,7 +1235,7 @@ public:
                 --_node;
                 _first = *_node;
                 _last = _first + static_cast<difference_type>(_buffer_size());
-                _cur = _last;
+                _cur = _last - 1;
             }
             else {
                 --_cur;
@@ -1260,11 +1254,11 @@ public:
         // 前缀--
         reverse_iterator& operator--() noexcept
         {
-            if (_cur == _last) {
+            if (_cur == _last - 1) {
                 ++_node;
-                _first = *node;
-                _cur = _first;
+                _first = *_node;
                 _last = _first + static_cast<difference_type>(_buffer_size());
+                _cur = _first;
             }
             else {
                 ++_cur;
@@ -1302,7 +1296,7 @@ public:
         }
 
         // + n
-        reverse_iterator operator+ (difference_type n) const
+        reverse_iterator operator+(difference_type n) const
         {
             reverse_iterator tmp = *this;
             return tmp += n;
@@ -1315,7 +1309,7 @@ public:
         }
 
         // - n
-        reverse_iterator operator- (difference_type n) const
+        reverse_iterator operator-(difference_type n) const
         {
             reverse_iterator tmp = *this;
             return tmp -= n;
@@ -1324,8 +1318,8 @@ public:
         // - reverse_iterator
         difference_type operator-(const reverse_iterator& other) const noexcept
         {
-            difference_type block_diff = _node - other._node;
-            difference_type cur_diff = (other._last - other._cur) - (_last - _cur);
+            difference_type block_diff = other._node - _node;
+            difference_type cur_diff = (other._cur - other._first) - (_cur - _first);
             return block_diff * static_cast<difference_type>(_buffer_size()) + cur_diff;
         }
 
@@ -1372,6 +1366,184 @@ public:
         static size_type _buffer_size() {
             return deque::buffer_size();
         }
+    };
+
+    class const_reverse_iterator
+    {
+        friend class reverse_iterator;
+        friend class deque<T, Alloc>;
+
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type = T;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const T*;
+        using reference = const T&;
+        using map_pointer = typename deque::pointer*;
+
+    public:
+        const_reverse_iterator() noexcept
+            : _cur(nullptr), _first(nullptr), _last(nullptr), _node(nullptr) {}
+        const_reverse_iterator(pointer cur, pointer first, pointer last, map_pointer node) noexcept
+            : _cur(cur), _first(first), _last(last), _node(node) {}
+        const_reverse_iterator(const reverse_iterator& it) noexcept 
+            : _cur(it._cur), _first(it._first), _last(it._last), _node(it._node) {}
+
+        reference operator*() const noexcept { return *_cur; }
+        pointer operator->() const noexcept { return _cur; }
+
+        const_reverse_iterator& operator++() noexcept {
+            if (_cur == _first) {
+                --_node;
+                _first = *_node;
+                _last = _first + _buffer_size();
+                _cur = _last - 1;
+            }
+            else {
+                --_cur;
+            }
+            return *this;
+        }
+
+        const_reverse_iterator operator++(int) noexcept {
+            const_reverse_iterator tmp = *this;
+            ++*this;
+            return tmp;
+        }
+
+        const_reverse_iterator& operator--() noexcept {
+            if (_cur == _last - 1) {
+                ++_node;
+                _first = *_node;
+                _last = _first + _buffer_size();
+                _cur = _first;
+            }
+            else {
+                ++_cur;
+            }
+            return *this;
+        }
+
+        const_reverse_iterator operator--(int) noexcept {
+            const_reverse_iterator tmp = *this;
+            --*this;
+            return tmp;
+        }
+
+        const_reverse_iterator& operator+=(difference_type n) {
+            const difference_type buf = static_cast<difference_type>(_buffer_size());
+            difference_type offset = (_cur - _first) - n;
+            difference_type block = offset / buf;
+            difference_type idx = offset % buf;
+
+            if (idx < 0) {
+                idx += buf;
+                --block;
+            }
+
+            _node += block;
+            _first = *_node;
+            _last = _first + buf;
+            _cur = _first + idx;
+            return *this;
+        }
+
+        const_reverse_iterator operator+(difference_type n) const {
+            const_reverse_iterator tmp = *this;
+            return tmp += n;
+        }
+
+        const_reverse_iterator& operator-=(difference_type n) {
+            return *this += -n;
+        }
+
+        const_reverse_iterator operator-(difference_type n) const {
+            const_reverse_iterator tmp = *this;
+            return tmp -= n;
+        }
+
+        difference_type operator-(const const_reverse_iterator& other) const noexcept {
+            difference_type block_diff = other._node - _node;
+            difference_type cur_diff = (other._cur - other._first) - (_cur - _first);
+            return block_diff * static_cast<difference_type>(_buffer_size()) + cur_diff;
+        }
+
+        reference operator[](difference_type n) const noexcept {
+            return *(*this + n);
+        }
+
+        bool operator==(const const_reverse_iterator& other) const noexcept {
+            return _cur == other._cur;
+        }
+        bool operator!=(const const_reverse_iterator& other) const noexcept {
+            return _cur != other._cur;
+        }
+        bool operator<(const const_reverse_iterator& other) const noexcept {
+            return (_node == other._node)
+                    ? (_cur > other._cur)
+                    : (_node > other._node);
+        }
+        bool operator>(const const_reverse_iterator& other) const noexcept {
+            return other < *this;
+        }
+        bool operator<=(const const_reverse_iterator& other) const noexcept {
+            return !(*this > other);
+        }
+        bool operator>=(const const_reverse_iterator& other) const noexcept {
+            return !(*this < other);
+        }
+
+    private:
+        pointer _cur;
+        pointer _first;
+        pointer _last;
+        map_pointer _node;
+
+        static size_type _buffer_size() {
+            return deque::buffer_size();
+        }
+    };
+
+    // 添加反向迭代器相关成员函数
+    reverse_iterator rbegin() noexcept {
+        if (empty()) {
+            return reverse_iterator(nullptr, nullptr, nullptr, nullptr);
+        }
+        return reverse_iterator(_finish._cur - 1, _finish._first, _finish._last, _finish._node);
+    }
+
+    reverse_iterator rend() noexcept {
+        if (empty()) {
+            return reverse_iterator(nullptr, nullptr, nullptr, nullptr);
+        }
+        return reverse_iterator(_start._cur - 1, _start._first, _start._last, _start._node);
+    }
+
+    const_reverse_iterator rbegin() const noexcept {
+        if (empty()) {
+            return const_reverse_iterator(nullptr, nullptr, nullptr, nullptr);
+        }
+        return const_reverse_iterator(_finish._cur - 1, _finish._first, _finish._last, _finish._node);
+    }
+
+    const_reverse_iterator rend() const noexcept {
+        if (empty()) {
+            return const_reverse_iterator(nullptr, nullptr, nullptr, nullptr);
+        }
+        return const_reverse_iterator(_start._cur - 1, _start._first, _start._last, _start._node);
+    }
+
+    const_reverse_iterator crbegin() const noexcept {
+        return rbegin();
+    }
+
+    const_reverse_iterator crend() const noexcept {
+        return rend();
+    }
+
+    // 添加 empty() 函数
+    bool empty() const noexcept {
+        return _start == _finish;
     }
 };
 }

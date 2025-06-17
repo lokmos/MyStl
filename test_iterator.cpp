@@ -5,7 +5,7 @@
 #include <numeric>
 #include <chrono>
 
-#include "iterator.h"
+#include "mystl_iterator.h"
 
 namespace mystl {
 
@@ -47,7 +47,7 @@ TEST(BidirectionalIteratorTest, BackwardTraversal) {
 TEST(RandomAccessIteratorTest, IndexAccessAndDistance) {
     random_access_iterator<int, false> it(const_cast<int*>(test_data));
 
-    for (int i = 0; i < test_size; ++i) {
+    for (size_t i = 0; i < test_size; ++i) {
         EXPECT_EQ(it[i], test_data[i]);
     }
 
