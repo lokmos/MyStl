@@ -1,52 +1,62 @@
 [
     {
-        "directory": "/home/zyk/C++/MyStl",
+        "directory": "/Users/violet/Tools/Code/MyStl",
         "command": "g++ -std=c++20 -Wall -Wextra -I. -c zyk_test.cpp",
         "file": "zyk_test.cpp"
-    },
+    }
+,
     {
-        "directory": "/home/zyk/C++/MyStl",
-        "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_allocator.h",
-        "file": "mystl_allocator.h"
-    },
-    {
-        "directory": "/home/zyk/C++/MyStl",
-        "command": "g++ -std=c++20 -Wall -Wextra -I. -fconcepts -fcoroutines -fmodules-ts -c mystl_deque.h",
-        "file": "mystl_deque.h"
-    },
-    {
-        "directory": "/home/zyk/C++/MyStl",
-        "command": "g++ -std=c++20 -Wall -Wextra -I. -c test_deque.cpp",
-        "file": "test_deque.cpp"
-    },
-    {
-        "directory": "/home/zyk/C++/MyStl",
+        "directory": "/Users/violet/Tools/Code/MyStl",
         "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_memory.h",
         "file": "mystl_memory.h"
-    },
+    }
+,
     {
-        "directory": "/home/zyk/C++/MyStl",
+        "directory": "/Users/violet/Tools/Code/MyStl",
         "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_iterator.h",
         "file": "mystl_iterator.h"
-    },
+    }
+,
     {
-        "directory": "/home/zyk/C++/MyStl",
-        "command": "g++ -std=c++20 -Wall -Wextra -I. -c vector_bench.cpp",
-        "file": "vector_bench.cpp"
-    },
-    {
-        "directory": "/home/zyk/C++/MyStl",
-        "command": "g++ -std=c++20 -Wall -Wextra -I. -c test_iterator.cpp",
-        "file": "test_iterator.cpp"
-    },
-    {
-        "directory": "/home/zyk/C++/MyStl",
+        "directory": "/Users/violet/Tools/Code/MyStl",
         "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_vector.h",
         "file": "mystl_vector.h"
-    },
+    }
+,
     {
-        "directory": "/home/zyk/C++/MyStl",
+        "directory": "/Users/violet/Tools/Code/MyStl",
+        "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_deque.h",
+        "file": "mystl_deque.h"
+    }
+,
+    {
+        "directory": "/Users/violet/Tools/Code/MyStl",
+        "command": "g++ -std=c++20 -Wall -Wextra -I. -c test_iterator.cpp",
+        "file": "test_iterator.cpp"
+    }
+,
+    {
+        "directory": "/Users/violet/Tools/Code/MyStl",
         "command": "g++ -std=c++20 -Wall -Wextra -I. -c test_vector.cpp",
         "file": "test_vector.cpp"
     }
+,
+    {
+        "directory": "/Users/violet/Tools/Code/MyStl",
+        "command": "g++ -std=c++20 -Wall -Wextra -I. -c mystl_allocator.h",
+        "file": "mystl_allocator.h"
+    }
+,
+    {
+        "directory": "/Users/violet/Tools/Code/MyStl",
+        "command": "g++ -std=c++20 -Wall -Wextra -I. -c vector_bench.cpp",
+        "file": "vector_bench.cpp"
+    }
+,
+    {
+        "directory": "/Users/violet/Tools/Code/MyStl",
+        "command": "g++ -std=c++20 -Wall -Wextra -I. -c test_deque.cpp",
+        "file": "test_deque.cpp"
+    }
+
 ]

@@ -3315,3 +3315,40 @@ void _reallocate_map(size_type add_front, size_type add_back)
 - 当容器内部既要分配元素类型 `T`，又要分配其它类型（比如迭代器需要的指针 map、node 链表架构等）时，就必须用 `rebind`（或 `allocator_traits::rebind_alloc`）来得到正确的分配器类型。
 - 保证类型安全——分配器知道自己在给哪种类型分配内存，`allocate(n)` 永远是分配 `n * sizeof(U)`。
 - 保证策略统一——即便你的 `Alloc` 是有状态的（记录了某些池子或标识），`rebind_alloc<pointer>` 也会把那个状态正确地“映射”到新的 `allocator<pointer>` 上。
+
+
+### emplace_front
+
+'emplace_back` 的反方向操作
+```c++
+template <typename... Args>
+reference emplace_front(Args&&... args)
+{
+    // 快路径：当前块还有剩余空间
+    if (_start._cur != _start._first) {
+        T* p = _start._cur - 1;
+        std::allocator_traits<allocator_type>::construct(_alloc, p, std::forward<Args>(args)...);
+        --_start._cur;
+        return *p;
+    }
+
+    // 慢路径：当前块已满，需要分配新块
+    // 如果前面没有多余块，需要重新分配空间
+    if (_start._node == _map) {
+        _reallocate_map(1, 0);
+    }
+
+    pointer* new_node = _start._node - 1;
+    *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buffer_size());
+    _start._node = new_node;
+    _start._first = *new_node;
+    _start._last = _start._first + buffer_size();
+    _start._cur = _start._last - 1;
+
+    // 在新 node 上构造元素
+    T* p = _start._cur;
+    std::allocator_traits<allocator_type>::construct(_alloc, p, std::forward<Args>(args)...);
+    --_start._cur;
+    return p;
+}
+```

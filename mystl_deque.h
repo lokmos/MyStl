@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <iterator>
 #include <algorithm>
-#include <new>
+#include <memory>
 #include "mystl_allocator.h"
 #include "mystl_iterator.h"
 
@@ -757,6 +757,81 @@ public:
         _finish = _start;
     }
 
+    // insert
+    iterator insert(const_iterator pos, const T& value)
+    {
+        // 1) 计算插入位置的偏移量
+        difference_type index = pos - cbegin();
+        difference_type num_elements = size();
+
+        // 2) Empty container
+        if (num_elements == 0) {
+            empalce_back(value);
+            return begin();
+        }
+
+        // 3) Special Case: insert at front or back
+        if (index == 0) {
+            emplace_front(value);
+            return begin();
+        } 
+        if (index == num_elements) {
+            emplace_back(value);
+            return end() - 1;
+        }
+
+        // 4) Check if there is enough space
+        bool front_has_space = _start._cur != _start._first;
+        bool back_has_space = _finish._cur != _finish._last;
+
+        // 5) Decide move strategy
+        bool move_front;
+
+        if (front_has_space && !back_has_space) {
+            move_front = true;
+        } else if (!front_has_space && back_has_space) {
+            move_front = false;
+        } else {
+            move_front = (index * 2 < num_elements);
+        }
+
+        if (move_front) {
+            return _insert_aux_front(index, value);
+        }
+        return _insert_aux_back(index, value);
+    }
+
+    template <typename... Args>
+    reference emplace_front(Args&&... args)
+    {
+        // 快路径：当前块还有剩余空间
+        if (_start._cur != _start._first) {
+            T* p = _start._cur - 1;
+            std::allocator_traits<allocator_type>::construct(_alloc, p, std::forward<Args>(args)...);
+            --_start._cur;
+            return *p;
+        }
+
+        // 慢路径：当前块已满，需要分配新块
+        // 如果前面没有多余块，需要重新分配空间
+        if (_start._node == _map) {
+            _reallocate_map(1, 0);
+        }
+
+        pointer* new_node = _start._node - 1;
+        *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buffer_size());
+        _start._node = new_node;
+        _start._first = *new_node;
+        _start._last = _start._first + buffer_size();
+        _start._cur = _start._last - 1;
+
+        // 在新 node 上构造元素
+        T* p = _start._cur;
+        std::allocator_traits<allocator_type>::construct(_alloc, p, std::forward<Args>(args)...);
+        --_start._cur;
+        return p;
+    }
+
     template <typename... Args>
     reference emplace_back(Args&&... args)
     {
@@ -923,6 +998,89 @@ private:
 
         // 3) 释放 _map 数组
         std::allocator_traits<map_allocator_type>::deallocate(_map_alloc, _map, _map_size);
+    }
+
+    // 向前移动元素并插入
+    iterator _insert_aux_front(difference_type index, const T& value)
+    {
+        bool front_has_space = _start._cur != _start._first;
+
+        if (!front_has_space) {
+            if (_start._node == _map) {
+                _reallocate_map(1, 0);
+            }
+            pointer* new_node = _start._node - 1;
+            *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buffer_size());
+            _start._node = new_node;
+            _start._first = *new_node;
+            _start._last = _start._first + buffer_size();
+            _start._cur = _start._last - 1;
+        }
+        else {
+            --_start._cur;
+        }
+
+        iterator front_pos = begin();
+        iterator old_front = front_pos + 1;
+        iterator target = front_pos + index + 1;
+
+        std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*front_pos));
+
+        for (auto it = old_front; it != target; ++it, ++front_pos) {
+            *front_pos = std::move(*it);
+        }
+
+        // 在目标位置放入新值
+        iterator result = front_pos;
+        if constexpr (std::is_trivially_copy_assignable_v<T>) {
+            *result = value;
+        } else {
+            std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*result));
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*result), value);
+        }
+
+        return result;
+    }
+
+    // 向后移动元素并插入
+    iterator _insert_aux_back(difference_type index, const T& value)
+    {
+        bool back_has_space = _finish._cur != _finish._last;
+
+        if (!back_has_space) {
+            if (_finish._node == _map + _map_size - 1) {
+                _reallocate_map(0, 1);
+            }
+            pointer* new_node = _finish._node + 1;
+            *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buffer_size());
+            _finish._node = new_node;
+            _finish._first = *new_node;
+            _finish._last = _finish._first + buffer_size();
+            _finish._cur = _finish._first;
+        }
+
+        iterator back_pos = end();
+        iterator old_back = back_pos - 1;
+        iterator target = begin() + index;
+
+        std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*back_pos));
+        ++_finish._cur;
+
+        while (old_back != target) {
+            *back_pos = std::move(*old_back);
+            --back_pos;
+            --old_back;
+        }
+
+        iterator result = target;
+        if constexpr (std::is_trivially_copy_assignable_v<T>) {
+            *result = value;
+        } else {
+            std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*result));
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*result), value);
+        }
+
+        return result;
     }
 
 public:
