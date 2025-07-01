@@ -859,7 +859,37 @@ public:
     template <typename InputIt>
     iterator insert(const_iterator pos, InputIt first, InputIt last)
     {
-        
+        difference_type index = pos - cbegin();
+        difference_type num_elements = size();
+
+        auto len = std::distance(first, last);
+        if (len == 0) {
+            return begin() + index;
+        }
+
+        bool move_front;
+        bool front_has_space = _start._cur - _start._first >= len;
+        bool back_has_space = _finish._last - _finish._cur >= len;
+
+        if (front_has_space && !back_has_space) {
+            move_front = true;
+        }
+        else if (!front_has_space && back_has_space) {
+            move_front = false;
+        }
+        else {
+            move_front = (index * 2 < num_elements);
+        }
+
+        if (move_front) {   
+            return _insert_aux_front(index, first, last);
+        }
+        return _insert_aux_back(index, first, last);
+    }
+
+    iterator insert(const_iterator pos, std::initializer_list<T> ilist)
+    {
+        return insert(pos, ilist.begin(), ilist.end());
     }
 
     template <typename... Args>
@@ -1159,6 +1189,68 @@ private:
         return result;
     }
 
+    template <typename InputIt>
+    iterator _insert_aux_front(difference_type index, InputIt first, InputIt last)
+    {
+        auto len = std::distance(first, last);
+        if (len == 0) {
+            return begin() + index;
+        }
+
+        bool front_has_space = _start._cur - _start._first >= len;
+
+        if (!front_has_space) {
+            size_type buf_sz = buffer_size();
+            size_type need_spaces = len - (_start._cur - _start._first);
+            size_type need_blocks = (need_spaces + buf_sz - 1) / buf_sz;
+
+            if (_start._node - _map < need_blocks) {
+                _reallocate_map(need_blocks, 0);
+            }
+            
+            for (size_type i = 0; i < need_blocks; ++i) {
+                pointer* new_node = _start._node - i - 1;
+                *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buf_sz);
+            }
+
+            _start._node -= need_blocks;
+            _start._first = *_start._node;
+            _start._last = _start._first + buf_sz;
+            _start._cur = _start._last - need_spaces % buf_sz;
+            if (_start._cur == _start._last) {
+                _start._cur = _start._first;
+            }
+        }
+        else {
+            _start._cur -= len;
+        }
+
+        iterator front_pos = begin();
+        iterator old_front = front_pos + len;
+        iterator target = front_pos + index + len;
+
+        for (iterator it = front_pos; it != old_front; ++it) {
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it));
+        }
+
+        for (iterator it = old_front; it != target; ++it) {
+            *(it - len) = std::move(*it);
+        }
+
+        iterator result = target - len;
+        for (size_type i = 0; i < len; ++i) {
+            if constexpr (std::is_trivially_copy_assignable_v<T>) {
+                *(result + i) = *first;
+            }
+            else {
+                std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*(result + i)));
+                std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*(result + i)), *first);
+            }
+            ++first;
+        }
+        return result;
+    }
+
     // 向后移动元素并插入
     iterator _insert_aux_back(difference_type index, const T& value)
     {
@@ -1250,6 +1342,64 @@ private:
                 std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*(result + i)));
                 std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*(result + i)), value);
             }
+        }
+        return result;
+    }
+
+    template <typename InputIt>
+    iterator _insert_aux_back(difference_type index, InputIt first, InputIt last)
+    {
+        auto len = std::distance(first, last);
+        if (len == 0) {
+            return begin() + index;
+        }
+
+        bool back_has_space = _finish._last - _finish._cur >= len;
+        if (!back_has_space) {
+            size_type buf_sz = buffer_size();
+            size_type need_spaces = len - (_finish._last - _finish._cur);
+            size_type need_blocks = (need_spaces + buf_sz - 1) / buf_sz;
+
+            if (_map + _map_size - 1 - _finish._node < need_blocks) {
+                _reallocate_map(0, need_blocks);
+            }
+            
+            for (size_type i = 0; i < need_blocks; ++i) {
+                pointer* new_node = _finish._node + i + 1;
+                *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buf_sz);
+            }
+
+            _finish._node += need_blocks;
+            _finish._first = *_finish._node;    
+            _finish._last = _finish._first + buf_sz;
+            _finish._cur = _finish._first + need_spaces % buf_sz;
+        }
+        else {
+            _finish._cur += len;
+        }
+
+        iterator back_pos = end();
+        iterator old_back = back_pos - len;
+        iterator target = begin() + index;
+
+        for (iterator it = old_back; it != back_pos; ++it) {
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it));
+        }
+
+        for (iterator it = old_back - 1; it >= target; --it) {
+            *(it + len) = std::move(*it);
+        }
+
+        iterator result = target;
+        for (size_type i = 0; i < len; ++i) {
+            if constexpr (std::is_trivially_copy_assignable_v<T>) {
+                *(result + i) = *first;
+            }
+            else {
+                std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*(result + i)));
+                std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*(result + i)), *first);
+            }
+            ++first;
         }
         return result;
     }
