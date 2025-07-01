@@ -801,6 +801,67 @@ public:
         return _insert_aux_back(index, value);
     }
 
+    iterator insert(const_iterator pos, T&& value)
+    {
+        return insert(pos, std::move(value));
+    }
+
+    iterator insert(const_iterator pos, size_type count, const T& value)
+    {
+        if (count == 0) {
+            return begin() + (pos - cbegin());  // 使用索引而不是直接与迭代器相加
+        }
+
+        difference_type index = pos - cbegin();
+        difference_type num_elements = size();
+
+        if (num_elements == 0) {
+            for (size_type i = 0; i < count; ++i) {
+                emplace_back(value);
+            }
+            return begin();
+        }
+
+        if (index == 0) {
+            for (size_type i = 0; i < count; ++i) {
+                emplace_front(value);
+            }
+            return begin();
+        }
+
+        if (index == num_elements) {
+            iterator result = end();  // 保存插入前的end()位置
+            for (size_type i = 0; i < count; ++i) {
+                emplace_back(value);
+            }
+            return result;  // 返回指向第一个插入元素的迭代器
+        }
+
+        bool front_has_space = _start._cur - _start._first >= count;
+        bool back_has_space = _finish._last - _finish._cur >= count;
+
+        bool move_front;
+
+        if (front_has_space && !back_has_space) {
+            move_front = true;
+        } else if (!front_has_space && back_has_space) {
+            move_front = false;
+        } else {
+            move_front = (index * 2 < num_elements);
+        }
+
+        if (move_front) {
+            return _insert_aux_front(index, count, value);
+        }
+        return _insert_aux_back(index, count, value);
+    }
+
+    template <typename InputIt>
+    iterator insert(const_iterator pos, InputIt first, InputIt last)
+    {
+        
+    }
+
     template <typename... Args>
     reference emplace_front(Args&&... args)
     {
@@ -866,6 +927,8 @@ public:
         ++_finish._cur;
         return *p;
     }
+
+
 
 private:
     // _map 指向一块 pointer 数组，数组中每个元素指向一个 buffer block
@@ -1042,6 +1105,60 @@ private:
         return result;
     }
 
+    iterator _insert_aux_front(difference_type index, size_type count, const T& value)
+    {
+        bool front_has_space = _start._cur - _start._first >= count;
+        if (!front_has_space) {
+            size_type buf_sz = buffer_size();
+            size_type need_spaces = count - (_start._cur - _start._first);
+            size_type need_blocks = (need_spaces + buf_sz - 1) / buf_sz;
+
+            if (_start._node - _map < need_blocks) {
+                _reallocate_map(need_blocks, 0);
+            }
+
+            for (size_type i = 0; i < need_blocks; ++i) {
+                pointer* new_node = _start._node - i - 1;
+                *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buf_sz);
+            }
+
+            _start._node -= need_blocks;
+            _start._first = *_start._node;
+            _start._last = _start._first + buf_sz;
+            _start._cur = _start._last - need_spaces % buf_sz;
+            if (_start._cur == _start._last) {
+                _start._cur = _start._first;
+            }
+        }
+        else {
+            _start._cur -= count;
+        }
+
+        iterator front_pos = begin();
+        iterator old_front = front_pos + count;
+        iterator target = front_pos + index + count;
+
+        for (iterator it = front_pos; it != old_front; ++it) {
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it));
+        }
+
+        for (iterator it = old_front; it != target; ++it) {
+            *(it - count) = std::move(*it);
+        }
+
+        iterator result = target - count;
+        for (size_type i = 0; i < count; ++i) {
+            if constexpr (std::is_trivially_copy_assignable_v<T>) {
+                *(result + i) = value;
+            }
+            else {
+                std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*(result + i)));
+                std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*(result + i)), value);
+            }
+        }
+        return result;
+    }
+
     // 向后移动元素并插入
     iterator _insert_aux_back(difference_type index, const T& value)
     {
@@ -1080,6 +1197,60 @@ private:
             std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*result), value);
         }
 
+        return result;
+    }
+
+    iterator _insert_aux_back(difference_type index, size_type count, const T& value)
+    {
+        bool back_has_space = _finish._last - _finish._cur >= count;
+        if (!back_has_space) {
+            size_type buf_sz = buffer_size();
+            size_type need_spaces = count - (_finish._last - _finish._cur);
+            size_type need_blocks = (need_spaces + buf_sz - 1) / buf_sz;
+
+            if (_map + _map_size - 1 - _finish._node < need_blocks) {
+                _reallocate_map(0, need_blocks);
+            }
+
+            for (size_type i = 0; i < need_blocks; ++i) {
+                pointer* new_node = _finish._node + i + 1;
+                *new_node = std::allocator_traits<allocator_type>::allocate(_alloc, buf_sz);
+            }
+
+            _finish._node += need_blocks;
+            _finish._first = *_finish._node;
+            _finish._last = _finish._first + buf_sz;
+            _finish._cur = _finish._first + need_spaces % buf_sz;
+            // 当need_spaces是buf_sz的整数倍时，_finish._cur会指向块的起始位置，这是正确的
+        }
+        else {
+            _finish._cur += count;
+        }
+
+        iterator back_pos = end();
+        iterator old_back = back_pos - count;
+        iterator target = begin() + index;
+
+        // 从前向后在新空间构造默认对象
+        for (iterator it = old_back; it != back_pos; ++it) {
+            std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*it));
+        }
+
+        // 从后向前移动元素，注意起始位置和终止条件
+        for (iterator it = old_back - 1; it >= target; --it) {
+            *(it + count) = std::move(*it);
+        }
+
+        iterator result = target;
+        for (size_type i = 0; i < count; ++i) {
+            if constexpr (std::is_trivially_copy_assignable_v<T>) {
+                *(result + i) = value;
+            }
+            else {
+                std::allocator_traits<allocator_type>::destroy(_alloc, std::addressof(*(result + i)));
+                std::allocator_traits<allocator_type>::construct(_alloc, std::addressof(*(result + i)), value);
+            }
+        }
         return result;
     }
 
