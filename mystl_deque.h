@@ -892,6 +892,23 @@ public:
         return insert(pos, ilist.begin(), ilist.end());
     }
 
+    // emplace
+    template <typename... Args>
+    iterator emplace(const_iterator pos, Args&&... args)
+    {
+        if (pos == cbegin()) {
+            emplace_front(std::forward<Args>(args)...);
+            return begin();
+        }
+        else if (pos == cend()) {
+            emplace_back(std::forward<Args>(args)...);
+            return end() - 1;
+        }
+        else {
+            return _emplace_aux(pos, std::forward<Args>(args)...);
+        }
+    }
+
     template <typename... Args>
     reference emplace_front(Args&&... args)
     {
@@ -1402,6 +1419,23 @@ private:
             ++first;
         }
         return result;
+    }
+
+    template <typename... Args>
+    iterator _emplace_aux(const_iterator pos, Args&&... args)
+    {
+        difference_type index = pos - begin();
+
+        if (index < size() / 2) {
+            emplace_front(std::forward<Args>(args)...);
+            std::rotate(begin(), begin() + 1, begin() + index + 1);
+        }
+        else {
+            emplace_back(std::forward<Args>(args)...);
+            std::rotate(begin() + index, end() - 1, end());
+        }
+
+        return begin() + index;
     }
 
 public:

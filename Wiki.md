@@ -3214,6 +3214,195 @@ void assign(std::initializer_list<value_type> ilist)
 
 ## Modifier
 
+### insert
+
+`insert` 包含了一系列不同的函数重载，但其遵循如下的逻辑
+1. 首先判断需要移动插入点前面的元素还是插入点后面的元素
+   - 优先级最高的判断是尽量不触发扩容
+     - 如果前面有足够的空间而后面没有，则移动前面的元素
+     - 如果后面有足够的空间而前面没有，则移动后面的元素
+   - 在都会足够空间或者都会触发扩容的情况下，则那部分需要移动的元素更少，就移动哪部分
+2. 如果需要扩容，则先扩容
+3. 移动元素，留出空间
+4. 从插入点开始，构造元素
+
+```c++
+// insert
+iterator insert(const_iterator pos, const T& value)
+{
+    // 1) 计算插入位置的偏移量
+    difference_type index = pos - cbegin();
+    difference_type num_elements = size();
+
+    // 2) Empty container
+    if (num_elements == 0) {
+        empalce_back(value);
+        return begin();
+    }
+
+    // 3) Special Case: insert at front or back
+    if (index == 0) {
+        emplace_front(value);
+        return begin();
+    } 
+    if (index == num_elements) {
+        emplace_back(value);
+        return end() - 1;
+    }
+
+    // 4) Check if there is enough space
+    bool front_has_space = _start._cur != _start._first;
+    bool back_has_space = _finish._cur != _finish._last;
+
+    // 5) Decide move strategy
+    bool move_front;
+
+    if (front_has_space && !back_has_space) {
+        move_front = true;
+    } else if (!front_has_space && back_has_space) {
+        move_front = false;
+    } else {
+        move_front = (index * 2 < num_elements);
+    }
+
+    if (move_front) {
+        return _insert_aux_front(index, value);
+    }
+    return _insert_aux_back(index, value);
+}
+
+iterator insert(const_iterator pos, T&& value)
+{
+    return insert(pos, std::move(value));
+}
+
+iterator insert(const_iterator pos, size_type count, const T& value)
+{
+    if (count == 0) {
+        return begin() + (pos - cbegin());  // 使用索引而不是直接与迭代器相加
+    }
+
+    difference_type index = pos - cbegin();
+    difference_type num_elements = size();
+
+    if (num_elements == 0) {
+        for (size_type i = 0; i < count; ++i) {
+            emplace_back(value);
+        }
+        return begin();
+    }
+
+    if (index == 0) {
+        for (size_type i = 0; i < count; ++i) {
+            emplace_front(value);
+        }
+        return begin();
+    }
+
+    if (index == num_elements) {
+        iterator result = end();  // 保存插入前的end()位置
+        for (size_type i = 0; i < count; ++i) {
+            emplace_back(value);
+        }
+        return result;  // 返回指向第一个插入元素的迭代器
+    }
+
+    bool front_has_space = _start._cur - _start._first >= count;
+    bool back_has_space = _finish._last - _finish._cur >= count;
+
+    bool move_front;
+
+    if (front_has_space && !back_has_space) {
+        move_front = true;
+    } else if (!front_has_space && back_has_space) {
+        move_front = false;
+    } else {
+        move_front = (index * 2 < num_elements);
+    }
+
+    if (move_front) {
+        return _insert_aux_front(index, count, value);
+    }
+    return _insert_aux_back(index, count, value);
+}
+
+template <typename InputIt>
+iterator insert(const_iterator pos, InputIt first, InputIt last)
+{
+    difference_type index = pos - cbegin();
+    difference_type num_elements = size();
+
+    auto len = std::distance(first, last);
+    if (len == 0) {
+        return begin() + index;
+    }
+
+    bool move_front;
+    bool front_has_space = _start._cur - _start._first >= len;
+    bool back_has_space = _finish._last - _finish._cur >= len;
+
+    if (front_has_space && !back_has_space) {
+        move_front = true;
+    }
+    else if (!front_has_space && back_has_space) {
+        move_front = false;
+    }
+    else {
+        move_front = (index * 2 < num_elements);
+    }
+
+    if (move_front) {   
+        return _insert_aux_front(index, first, last);
+    }
+    return _insert_aux_back(index, first, last);
+}
+
+iterator insert(const_iterator pos, std::initializer_list<T> ilist)
+{
+    return insert(pos, ilist.begin(), ilist.end());
+}
+```
+
+### emplace
+
+该函数，如果插入的是两边的位置，那么调用 `emplace_front` 或 `emplace_back` 即可；如果插入的是中间的位置，则需要现在别处构造出插入对象，然后移动到对应的位置上，这一点，在辅助函数中，通过标准库的 `std::rotate` 实现
+
+```c++
+// emplace
+template <typename... Args>
+iterator emplace(const_iterator pos, Args&&... args)
+{
+    if (pos == cbegin()) {
+        emplace_front(std::forward<Args>(args)...);
+        return begin();
+    }
+    else if (pos == cend()) {
+        emplace_back(std::forward<Args>(args)...);
+        return end() - 1;
+    }
+    else {
+        return _emplace_aux(pos, std::forward<Args>(args)...);
+    }
+}
+
+template <typename... Args>
+iterator _emplace_aux(const_iterator pos, Args&&... args)
+{
+    difference_type index = pos - begin();
+
+    if (index < size() / 2) {
+        emplace_front(std::forward<Args>(args)...);
+        std::rotate(begin(), begin() + 1, begin() + index + 1);
+    }
+    else {
+        emplace_back(std::forward<Args>(args)...);
+        std::rotate(begin() + index, end() - 1, end());
+    }
+
+    return begin() + index;
+}
+```
+
 ### emplace_back
 
 Appends a new element to the end of the container. The element is constructed through std::allocator_traits::construct, which typically uses placement new to construct the element in-place at the location provided by the container. The arguments `args...` are forwarded to the constructor as `std::forward<Args>(args)...`
